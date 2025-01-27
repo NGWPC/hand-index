@@ -30,12 +30,6 @@ CREATE TABLE HAND_Catchment_Rasters (
     metadata JSONB
 );
 
-CREATE TABLE HydroIDs (
-    HydroID TEXT,
-    hand_version_id TEXT REFERENCES HAND_Versions(hand_version_id),
-    PRIMARY KEY (HydroID, hand_version_id)
-);
-
 CREATE TABLE NWM_Features (
     nwm_feature_id INTEGER,
     nwm_version_id TEXT,
@@ -51,7 +45,7 @@ CREATE TABLE NWM_Features (
 );
 
 CREATE TABLE NWM_Lakes (
-    nwm_lake_id TEXT PRIMARY KEY,
+    nwm_lake_id INTEGER PRIMARY KEY,
     geometry GEOMETRY,
     shape_area DECIMAL,
     CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(geometry) IN ('ST_MultiPolygon', 'ST_Polygon'))
@@ -70,9 +64,8 @@ CREATE TABLE Levees (
 
 CREATE TABLE HUCS (
     huc_id TEXT PRIMARY KEY,
-    huc_order INTEGER,
+    level INTEGER,
     geometry GEOMETRY,
-    level TEXT,
     area_sq_km DECIMAL,
     states TEXT,
     CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(geometry) IN ('ST_MultiPolygon', 'ST_Polygon'))
@@ -98,13 +91,12 @@ CREATE TABLE Metrics (
     calibrated BOOLEAN,
     false_negatives_count INTEGER,
     ACC DECIMAL,
-    OTHER_METRICS JSONB,
+    OTHER_METRICS TEXT,
     CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(benchmark_geom) IN ('ST_MultiPolygon', 'ST_Polygon'))
 );
 
 CREATE TABLE Hydrotables (
-    hydrotable_id UUID PRIMARY KEY,
-    catchment_id UUID REFERENCES Catchments(catchment_id),
+    catchment_id UUID PRIMARY KEY REFERENCES Catchments(catchment_id),
     hand_version_id TEXT REFERENCES HAND_Versions(hand_version_id),
     HydroID TEXT,
     nwm_version_id INTEGER,
@@ -148,7 +140,6 @@ CREATE TABLE Hydrotables (
 );
 
 -- Create indexes
-CREATE INDEX idx_hydrotables_hydroid_version ON Hydrotables(HydroID, hand_version_id);
 CREATE INDEX idx_hydrotables_nwm_feature ON Hydrotables(nwm_feature_id, nwm_version_id);
 
 -- Create spatial indexes
