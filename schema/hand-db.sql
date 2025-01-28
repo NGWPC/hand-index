@@ -32,9 +32,9 @@ CREATE TABLE HAND_Catchment_Rasters (
 
 CREATE TABLE NWM_Features (
     nwm_feature_id INTEGER,
-    nwm_version_id TEXT,
+    nwm_version_id DECIMAL,
     geometry GEOMETRY,
-    to INTEGER,
+    to_feature INTEGER,
     stream_order INTEGER,
     lake INTEGER,
     gages TEXT,
@@ -52,10 +52,10 @@ CREATE TABLE NWM_Lakes (
 );
 
 CREATE TABLE Levees (
-    levee_id INTEGER PRIMARY KEY,
+    levee_id BIGINT PRIMARY KEY,  -- Changed from INTEGER to BIGINT
     geometry GEOMETRY,
     name TEXT,
-    systemID INTEGER,
+    systemID BIGINT,  -- Changed from INTEGER to BIGINT
     systemName TEXT,
     areaSquareMiles DECIMAL,
     leveedAreaSource TEXT,
@@ -96,10 +96,10 @@ CREATE TABLE Metrics (
 );
 
 CREATE TABLE Hydrotables (
-    catchment_id UUID PRIMARY KEY REFERENCES Catchments(catchment_id),
+    catchment_id UUID REFERENCES Catchments(catchment_id),
     hand_version_id TEXT REFERENCES HAND_Versions(hand_version_id),
     HydroID TEXT,
-    nwm_version_id INTEGER,
+    nwm_version_id DECIMAL,
     nwm_feature_id INTEGER,
     order_id INTEGER,
     number_of_cells INTEGER,
@@ -136,7 +136,8 @@ CREATE TABLE Hydrotables (
     calb_coef_spatial DECIMAL,
     calb_coef_final DECIMAL,
     huc_id TEXT REFERENCES HUCS(huc_id),
-    lake_id TEXT
+    lake_id TEXT,
+    PRIMARY KEY (catchment_id, HydroID, stage)
 );
 
 -- Create indexes
