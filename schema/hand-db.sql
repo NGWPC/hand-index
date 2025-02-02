@@ -1,33 +1,12 @@
 -- Enable PostGIS extension if not already enabled
 CREATE EXTENSION IF NOT EXISTS postgis;
 
--- Create tables
+-- Create base tables first (tables with no dependencies)
 CREATE TABLE Catchments (
     catchment_id UUID PRIMARY KEY,
     geometry GEOMETRY,
     additional_attributes JSONB,
     CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(geometry) IN ('ST_MultiPolygon', 'ST_Polygon'))
-);
-
-CREATE TABLE HAND_Versions (
-    hand_version_id TEXT PRIMARY KEY,
-    release_date DATE,
-    description TEXT
-);
-
-CREATE TABLE HAND_REM_Rasters (
-    rem_raster_id UUID PRIMARY KEY,
-    catchment_id UUID REFERENCES Catchments(catchment_id),
-    hand_version_id TEXT REFERENCES HAND_Versions(hand_version_id),
-    raster_path TEXT,
-    metadata JSONB
-);
-
-CREATE TABLE HAND_Catchment_Rasters (
-    catchment_raster_id UUID PRIMARY KEY,
-    rem_raster_id UUID REFERENCES HAND_REM_Rasters(rem_raster_id),
-    raster_path TEXT,
-    metadata JSONB
 );
 
 CREATE TABLE NWM_Features (
@@ -52,10 +31,10 @@ CREATE TABLE NWM_Lakes (
 );
 
 CREATE TABLE Levees (
-    levee_id BIGINT PRIMARY KEY,  -- Changed from INTEGER to BIGINT
+    levee_id BIGINT PRIMARY KEY,
     geometry GEOMETRY,
     name TEXT,
-    systemID BIGINT,  -- Changed from INTEGER to BIGINT
+    systemID BIGINT,
     systemName TEXT,
     areaSquareMiles DECIMAL,
     leveedAreaSource TEXT,
@@ -71,33 +50,10 @@ CREATE TABLE HUCS (
     CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(geometry) IN ('ST_MultiPolygon', 'ST_Polygon'))
 );
 
-CREATE TABLE Benchmark_HUC_Relations (
-    relation_id UUID PRIMARY KEY,
-    benchmark_geom GEOMETRY,
-    huc_id TEXT REFERENCES HUCS(huc_id),
-    CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(benchmark_geom) IN ('ST_MultiPolygon', 'ST_Polygon'))
-);
-
-CREATE TABLE Metrics (
-    metric_id UUID PRIMARY KEY,
-    hand_version_id TEXT REFERENCES HAND_Versions(hand_version_id),
-    relation_id UUID REFERENCES Benchmark_HUC_Relations(relation_id),
-    benchmark_geom GEOMETRY,
-    ver_env TEXT,
-    lid TEXT,
-    magnitude TEXT,
-    benchmark_source TEXT,
-    extent_config TEXT,
-    calibrated BOOLEAN,
-    false_negatives_count INTEGER,
-    ACC DECIMAL,
-    OTHER_METRICS TEXT,
-    CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(benchmark_geom) IN ('ST_MultiPolygon', 'ST_Polygon'))
-);
-
+-- Create Hydrotables before tables that reference it
 CREATE TABLE Hydrotables (
     catchment_id UUID REFERENCES Catchments(catchment_id),
-    hand_version_id TEXT REFERENCES HAND_Versions(hand_version_id),
+    hand_version_id TEXT UNIQUE,
     HydroID TEXT,
     nwm_version_id DECIMAL,
     nwm_feature_id INTEGER,
@@ -137,7 +93,47 @@ CREATE TABLE Hydrotables (
     calb_coef_final DECIMAL,
     huc_id TEXT REFERENCES HUCS(huc_id),
     lake_id TEXT,
-    PRIMARY KEY (catchment_id, HydroID, stage)
+    PRIMARY KEY (catchment_id, hand_version_id, HydroID, stage)
+);
+
+-- Now create tables that depend on Hydrotables
+CREATE TABLE Benchmark_HUC_Relations (
+    relation_id UUID PRIMARY KEY,
+    benchmark_geom GEOMETRY,
+    huc_id TEXT REFERENCES HUCS(huc_id),
+    CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(benchmark_geom) IN ('ST_MultiPolygon', 'ST_Polygon'))
+);
+
+CREATE TABLE HAND_REM_Rasters (
+    rem_raster_id UUID PRIMARY KEY,
+    catchment_id UUID REFERENCES Catchments(catchment_id),
+    hand_version_id TEXT REFERENCES Hydrotables(hand_version_id),
+    raster_path TEXT,
+    metadata JSONB
+);
+
+CREATE TABLE HAND_Catchment_Rasters (
+    catchment_raster_id UUID PRIMARY KEY,
+    rem_raster_id UUID REFERENCES HAND_REM_Rasters(rem_raster_id),
+    raster_path TEXT,
+    metadata JSONB
+);
+
+CREATE TABLE Metrics (
+    metric_id UUID PRIMARY KEY,
+    hand_version_id TEXT REFERENCES Hydrotables(hand_version_id),
+    relation_id UUID REFERENCES Benchmark_HUC_Relations(relation_id),
+    benchmark_geom GEOMETRY,
+    ver_env TEXT,
+    lid TEXT,
+    magnitude TEXT,
+    benchmark_source TEXT,
+    extent_config TEXT,
+    calibrated BOOLEAN,
+    false_negatives_count INTEGER,
+    ACC DECIMAL,
+    OTHER_METRICS TEXT,
+    CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(benchmark_geom) IN ('ST_MultiPolygon', 'ST_Polygon'))
 );
 
 -- Create indexes
