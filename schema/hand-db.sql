@@ -59,7 +59,7 @@ CREATE TABLE Hydrotables (
     hand_version_id TEXT REFERENCES Hand_Versions(hand_version_id),
     HydroID TEXT,
     nwm_version_id DECIMAL,
-    nwm_feature_id INTEGER,
+    nwm_feature_id BIGINT,
     order_id INTEGER,
     number_of_cells INTEGER,
     surface_area_m2 DECIMAL,
