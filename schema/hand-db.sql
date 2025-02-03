@@ -14,7 +14,7 @@ CREATE TABLE Catchments (
 );
 
 CREATE TABLE NWM_Features (
-    nwm_feature_id INTEGER,
+    nwm_feature_id BIGINT,
     nwm_version_id DECIMAL,
     geometry GEOMETRY,
     to_feature INTEGER,
