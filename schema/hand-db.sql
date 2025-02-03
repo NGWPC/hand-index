@@ -1,9 +1,13 @@
--- Enable PostGIS extension if not already enabled
+-- Enable PostGIS extension
 CREATE EXTENSION IF NOT EXISTS postgis;
 
--- Create base tables first (tables with no dependencies)
+CREATE TABLE Hand_Versions (
+    hand_version_id TEXT PRIMARY KEY
+);
+
 CREATE TABLE Catchments (
     catchment_id UUID PRIMARY KEY,
+    hand_version_id TEXT REFERENCES Hand_Versions(hand_version_id),
     geometry GEOMETRY,
     additional_attributes JSONB,
     CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(geometry) IN ('ST_MultiPolygon', 'ST_Polygon'))
@@ -50,10 +54,9 @@ CREATE TABLE HUCS (
     CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(geometry) IN ('ST_MultiPolygon', 'ST_Polygon'))
 );
 
--- Create Hydrotables before tables that reference it
 CREATE TABLE Hydrotables (
     catchment_id UUID REFERENCES Catchments(catchment_id),
-    hand_version_id TEXT UNIQUE,
+    hand_version_id TEXT REFERENCES Hand_Versions(hand_version_id),
     HydroID TEXT,
     nwm_version_id DECIMAL,
     nwm_feature_id INTEGER,
@@ -96,7 +99,6 @@ CREATE TABLE Hydrotables (
     PRIMARY KEY (catchment_id, hand_version_id, HydroID, stage)
 );
 
--- Now create tables that depend on Hydrotables
 CREATE TABLE Benchmark_HUC_Relations (
     relation_id UUID PRIMARY KEY,
     benchmark_geom GEOMETRY,
@@ -107,7 +109,7 @@ CREATE TABLE Benchmark_HUC_Relations (
 CREATE TABLE HAND_REM_Rasters (
     rem_raster_id UUID PRIMARY KEY,
     catchment_id UUID REFERENCES Catchments(catchment_id),
-    hand_version_id TEXT REFERENCES Hydrotables(hand_version_id),
+    hand_version_id TEXT REFERENCES Hand_Versions(hand_version_id),
     raster_path TEXT,
     metadata JSONB
 );
@@ -121,7 +123,7 @@ CREATE TABLE HAND_Catchment_Rasters (
 
 CREATE TABLE Metrics (
     metric_id UUID PRIMARY KEY,
-    hand_version_id TEXT REFERENCES Hydrotables(hand_version_id),
+    hand_version_id TEXT REFERENCES Hand_Versions(hand_version_id),
     relation_id UUID REFERENCES Benchmark_HUC_Relations(relation_id),
     benchmark_geom GEOMETRY,
     ver_env TEXT,
