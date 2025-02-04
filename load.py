@@ -156,23 +156,6 @@ class DatabaseLoader:
                 return pd.read_csv(tmp.name)
         return pd.read_csv(csv_path)
 
-    def _insert_catchment(self, catchment_id, geometry):
-        """Insert catchment geometry into database."""
-        with self.engine.begin() as conn:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO Catchments (catchment_id, hand_version_id, geometry)
-                    VALUES (:catch_id, :hand_id, ST_GeomFromText(:geom, 5070))
-                """
-                ),
-                {
-                    "catch_id": catchment_id,
-                    "hand_id": self.hand_version_id,
-                    "geom": geometry.wkt,
-                },
-            )
-
     def load_general_data(self, general_dir):
         """Load data from the general directory (local or S3)."""
         print("Loading data from general directory...")
@@ -199,32 +182,237 @@ class DatabaseLoader:
         self.load_nwm_features([f for f in files if "nwm_flows" in f][0])
 
     def load_hand_data(self, hand_dir):
-        """Main entry point for HAND data loading"""
+        """Main entry point for HAND data loading with error handling"""
         catchment_dirs = self._get_catchment_dirs(hand_dir)
         total = len(catchment_dirs)
 
         print(f"Found {total} catchments to process")
         for idx, catchment_dir in enumerate(catchment_dirs, 1):
             print(f"\nProcessing catchment {idx}/{total}: {catchment_dir}")
-            catchment_id = self.load_catchment_geometry(catchment_dir)
-            self.load_hydrotables(catchment_dir, catchment_id)
-            self.load_rasters(catchment_dir, catchment_id)
+            try:
+                with self.engine.begin() as transaction:
+                    # All operations for this catchment will be in a single transaction
+                    catchment_id = self.load_catchment_geometry(
+                        catchment_dir, transaction
+                    )
+                    if catchment_id is None:
+                        print(
+                            f"  Skipping catchment {catchment_dir} - No valid geometry found"
+                        )
+                        continue
 
-    def load_catchment_geometry(self, catchment_dir):
-        """Load and merge catchment geometries"""
+                    self.load_hydrotables(catchment_dir, catchment_id, transaction)
+                    self.load_rasters(catchment_dir, catchment_id, transaction)
+
+            except Exception as e:
+                print(f"  Error processing catchment {catchment_dir}: {str(e)}")
+                # Transaction will automatically rollback due to the context manager
+                self._cleanup_catchment(catchment_id)
+                continue
+
+    def _cleanup_catchment(self, catchment_id):
+        """Clean up any data associated with a failed catchment load"""
+        if catchment_id is None:
+            return
+
+        print(f"  Cleaning up data for catchment {catchment_id}")
+        with self.engine.begin() as conn:
+            # Delete from all related tables in reverse order of dependencies
+            conn.execute(
+                text(
+                    """
+                    DELETE FROM Hydrotables 
+                    WHERE catchment_id = :catch_id AND hand_version_id = :hand_id
+                """
+                ),
+                {"catch_id": catchment_id, "hand_id": self.hand_version_id},
+            )
+
+            conn.execute(
+                text(
+                    """
+                    DELETE FROM HAND_REM_Rasters 
+                    WHERE catchment_id = :catch_id AND hand_version_id = :hand_id
+                """
+                ),
+                {"catch_id": catchment_id, "hand_id": self.hand_version_id},
+            )
+
+            conn.execute(
+                text(
+                    """
+                    DELETE FROM Catchments 
+                    WHERE catchment_id = :catch_id AND hand_version_id = :hand_id
+                """
+                ),
+                {"catch_id": catchment_id, "hand_id": self.hand_version_id},
+            )
+
+    def load_catchment_geometry(self, catchment_dir, transaction):
+        """Load and merge catchment geometries with error handling"""
         print("  Loading catchment geometry...")
         gpkg_files = self._get_files(catchment_dir, ".gpkg", "gw_catchments")
-        merged_geom = None
 
+        if not gpkg_files:
+            print("  No geometry files found")
+            return None
+
+        merged_geom = None
         with tempfile.TemporaryDirectory() as tmpdir:
             for gpkg in gpkg_files:
-                local_path = self._download_if_s3(gpkg, tmpdir)
-                gdf = gpd.read_file(local_path)
-                merged_geom = self._merge_geometries(merged_geom, gdf)
+                try:
+                    local_path = self._download_if_s3(gpkg, tmpdir)
+                    gdf = gpd.read_file(local_path)
+                    if not gdf.empty:
+                        merged_geom = self._merge_geometries(merged_geom, gdf)
+                except Exception as e:
+                    print(f"  Error processing geometry file {gpkg}: {str(e)}")
+                    continue
+
+        if merged_geom is None:
+            return None
 
         catchment_id = self._generate_uuid(str(merged_geom.wkt))
-        self._insert_catchment(catchment_id, merged_geom)
+        transaction.execute(
+            text(
+                """
+                INSERT INTO Catchments (catchment_id, hand_version_id, geometry)
+                VALUES (:catch_id, :hand_id, ST_GeomFromText(:geom, 5070))
+            """
+            ),
+            {
+                "catch_id": catchment_id,
+                "hand_id": self.hand_version_id,
+                "geom": merged_geom.wkt,
+            },
+        )
         return catchment_id
+
+    def load_hydrotables(self, catchment_dir, catchment_id, transaction):
+        """Load hydrotable CSVs with proper version handling and error checking"""
+        print("  Loading hydrotables...")
+        csv_files = self._get_files(catchment_dir, ".csv", "hydroTable_")
+
+        if not csv_files:
+            print("  No hydrotable files found")
+            return
+
+        for csv_path in csv_files:
+            try:
+                df = self._read_csv(csv_path)
+                self._insert_hydro_records(df, catchment_id, transaction)
+            except Exception as e:
+                print(f"  Error processing hydrotable {csv_path}: {str(e)}")
+                raise
+
+    def _insert_hydro_records(self, df, catchment_id, transaction):
+        """Batch insert hydrotable records using transaction"""
+        for _, row in df.iterrows():
+            transaction.execute(
+                text(
+                    """
+                    INSERT INTO Hydrotables (
+                        catchment_id, hand_version_id, HydroID, nwm_version_id,
+                        nwm_feature_id, order_id, number_of_cells, surface_area_m2,
+                        bed_area_m2, top_width_m, length_km, area_sq_km,
+                        wetted_perimeter_m, hydraulic_radius_m, wet_area_m2,
+                        volume_m3, slope, manning_n, stage, discharge_cms,
+                        default_discharge_cms, default_volume_m3, default_wet_area_m2,
+                        default_hydraulic_radius_m, default_manning_n,
+                        bathymetry_source, subdiv_applied, overbank_n, channel_n,
+                        subdiv_discharge_cms, calb_applied, lake_id
+                    ) VALUES (
+                        :catch_id, :hand_id, :hydro_id, :nwm_ver, :feat_id,
+                        :order_id, :num_cells, :surf_area, :bed_area, :top_width,
+                        :length, :area, :wet_perim, :hydraulic_r, :wet_area,
+                        :volume, :slope, :manning_n, :stage, :discharge,
+                        :def_discharge, :def_volume, :def_wet_area,
+                        :def_hydraulic_r, :def_manning_n, :bath_source,
+                        :subdiv_applied, :overbank_n, :channel_n,
+                        :subdiv_discharge, :calb_applied, :lake_id
+                    )
+                """
+                ),
+                self._prepare_hydro_params(row, catchment_id),
+            )
+
+    def _prepare_hydro_params(self, row, catchment_id):
+        """Prepare parameters for hydrotable insert with proper null handling"""
+
+        def safe_get(key, default=None):
+            return row.get(key, default) if key in row else default
+
+        return {
+            "catch_id": catchment_id,
+            "hand_id": self.hand_version_id,
+            "hydro_id": safe_get("HydroID"),
+            "nwm_ver": self.nwm_version_id,
+            "feat_id": safe_get("feature_id"),
+            "order_id": safe_get("order", 0),
+            "num_cells": safe_get("Number of Cells", 0),
+            "surf_area": safe_get("SurfaceArea (m2)"),
+            "bed_area": safe_get("BedArea (m2)"),
+            "top_width": safe_get("TopWidth (m)"),
+            "length": safe_get("LENGTHKM"),
+            "area": safe_get("AREASQKM"),
+            "wet_perim": safe_get("WettedPerimeter (m)"),
+            "hydraulic_r": safe_get("HydraulicRadius (m)"),
+            "wet_area": safe_get("WetArea (m2)"),
+            "volume": safe_get("Volume (m3)"),
+            "slope": safe_get("SLOPE"),
+            "manning_n": safe_get("ManningN"),
+            "stage": safe_get("stage"),
+            "discharge": safe_get("discharge_cms"),
+            "def_discharge": safe_get("default_discharge_cms"),
+            "def_volume": safe_get("default_Volume (m3)"),
+            "def_wet_area": safe_get("default_WetArea (m2)"),
+            "def_hydraulic_r": safe_get("default_HydraulicRadius (m)"),
+            "def_manning_n": safe_get("default_ManningN"),
+            "bath_source": safe_get("Bathymetry_source"),
+            "subdiv_applied": safe_get("subdiv_applied", False),
+            "overbank_n": safe_get("overbank_n"),
+            "channel_n": safe_get("channel_n"),
+            "subdiv_discharge": safe_get("subdiv_discharge_cms"),
+            "calb_applied": safe_get("calb_applied", False),
+            "lake_id": safe_get("LakeID"),
+        }
+
+    def load_rasters(self, catchment_dir, catchment_id, transaction):
+        """Load all raster data types with error handling"""
+        print("  Loading REM rasters...")
+        rem_files = self._get_files(catchment_dir, ".tif", "rem_zeroed_")
+
+        if not rem_files:
+            print("  No REM raster files found")
+            return
+
+        try:
+            self._insert_rasters(
+                rem_files, catchment_id, "HAND_REM_Rasters", transaction
+            )
+        except Exception as e:
+            print(f"  Error processing rasters: {str(e)}")
+            raise
+
+    def _insert_rasters(self, files, catchment_id, table_name, transaction):
+        """Generic raster insertion method with transaction support"""
+        for file_path in files:
+            file_id = self._generate_uuid(file_path)
+            transaction.execute(
+                text(
+                    f"""
+                    INSERT INTO {table_name}
+                    (rem_raster_id, catchment_id, hand_version_id, raster_path)
+                    VALUES (:id, :catch_id, :version, :path)
+                """
+                ),
+                {
+                    "id": file_id,
+                    "catch_id": catchment_id,
+                    "version": self.hand_version_id,
+                    "path": file_path,
+                },
+            )
 
     def load_nwm_lakes(self, gpkg_path):
         """Load NWM lakes from GeoPackage (local or S3)."""
@@ -235,9 +423,9 @@ class DatabaseLoader:
                     conn.execute(
                         text(
                             """
-                        INSERT INTO NWM_Lakes (nwm_lake_id, geometry, shape_area)
-                        VALUES (:id, ST_GeomFromText(:geom, 5070), :area)
-                    """
+                            INSERT INTO NWM_Lakes (nwm_lake_id, geometry, shape_area)
+                            VALUES (:id, ST_GeomFromText(:geom, 5070), :area)
+                        """
                         ),
                         {
                             "id": row["newID"],
@@ -266,9 +454,9 @@ class DatabaseLoader:
                             conn.execute(
                                 text(
                                     """
-                                INSERT INTO HUCS (huc_id, level, geometry, area_sq_km, states)
-                                VALUES (:huc_id, :level, ST_GeomFromText(:geom, 5070), :area, :states)
-                            """
+                                    INSERT INTO HUCS (huc_id, level, geometry, area_sq_km, states)
+                                    VALUES (:huc_id, :level, ST_GeomFromText(:geom, 5070), :area, :states)
+                                """
                                 ),
                                 {
                                     "huc_id": row[f"HUC{level}"],
@@ -288,11 +476,11 @@ class DatabaseLoader:
                     conn.execute(
                         text(
                             """
-                        INSERT INTO Levees (levee_id, geometry, name, systemID, 
-                                          systemName, areaSquareMiles, leveedAreaSource)
-                        VALUES (:id, ST_GeomFromText(:geom, 5070), :name, 
-                               :sys_id, :sys_name, :area, :source)
-                    """
+                            INSERT INTO Levees (levee_id, geometry, name, systemID, 
+                                              systemName, areaSquareMiles, leveedAreaSource)
+                            VALUES (:id, ST_GeomFromText(:geom, 5070), :name, 
+                                   :sys_id, :sys_name, :area, :source)
+                        """
                         ),
                         {
                             "id": row["id"],
@@ -316,12 +504,12 @@ class DatabaseLoader:
                     result = conn.execute(
                         text(
                             """
-                        INSERT INTO NWM_Features (nwm_feature_id, nwm_version_id, geometry,
-                                                to_feature, stream_order, lake, gages, slope, mainstem)
-                        VALUES (:feat_id, :ver_id, ST_GeomFromText(:geom, 5070),
-                                :to_feature, :order, :lake, :gages, :slope, :mainstem)
-                        ON CONFLICT (nwm_feature_id, nwm_version_id) DO NOTHING
-                    """
+                            INSERT INTO NWM_Features (nwm_feature_id, nwm_version_id, geometry,
+                                                    to_feature, stream_order, lake, gages, slope, mainstem)
+                            VALUES (:feat_id, :ver_id, ST_GeomFromText(:geom, 5070),
+                                    :to_feature, :order, :lake, :gages, :slope, :mainstem)
+                            ON CONFLICT (nwm_feature_id, nwm_version_id) DO NOTHING
+                        """
                         ),
                         {
                             "feat_id": row["ID"],
@@ -339,184 +527,6 @@ class DatabaseLoader:
                         dropped_count += 1
             print(f"Dropped {dropped_count} duplicate NWM features")
 
-    def load_hand_rem_rasters(self, catchment_dir, catchment_id):
-        """Load HAND REM rasters for a catchment."""
-        print("  Loading REM rasters...")
-        if self.is_s3_path(catchment_dir):
-            objects = self.list_s3_objects(catchment_dir)
-            rem_files = [
-                f"s3://{self.parse_s3_path(catchment_dir)[0]}/{key}"
-                for key in objects
-                if "rem_zeroed_masked_" in key
-            ]
-        else:
-            rem_files = [
-                os.path.join(catchment_dir, f)
-                for f in os.listdir(catchment_dir)
-                if f.startswith("rem_zeroed_masked_")
-            ]
-
-        with self.engine.begin() as conn:
-            for rem_path in rem_files:
-                rem_raster_id = self.generate_deterministic_uuid(rem_path)
-                conn.execute(
-                    text(
-                        """
-                    INSERT INTO HAND_REM_Rasters (rem_raster_id, catchment_id,
-                                                hand_version_id, raster_path)
-                    VALUES (:rem_id, :catch_id, :hand_id, :path)
-                """
-                    ),
-                    {
-                        "rem_id": rem_raster_id,
-                        "catch_id": catchment_id,
-                        "hand_id": self.hand_version_id,
-                        "path": rem_path,
-                    },
-                )
-
-    def load_hand_catchment_rasters(self, catchment_dir, catchment_id):
-        """Load HAND catchment rasters."""
-        print("  Loading catchment rasters...")
-        if self.is_s3_path(catchment_dir):
-            objects = self.list_s3_objects(catchment_dir)
-            catchment_files = [
-                f"s3://{self.parse_s3_path(catchment_dir)[0]}/{key}"
-                for key in objects
-                if key.endswith(".tif") and "gw_catchments" in key
-            ]
-        else:
-            catchment_files = [
-                os.path.join(catchment_dir, f)
-                for f in os.listdir(catchment_dir)
-                if f.endswith(".tif") and "gw_catchments_addedAttributes" in f
-            ]
-
-        with self.engine.begin() as conn:
-            for catchment_path in catchment_files:
-                catchment_raster_id = self.generate_deterministic_uuid(catchment_path)
-                conn.execute(
-                    text(
-                        """
-                    INSERT INTO HAND_Catchment_Rasters (catchment_raster_id,
-                                                      rem_raster_id, raster_path)
-                    VALUES (:catch_id, (SELECT rem_raster_id FROM HAND_REM_Rasters
-                                      WHERE raster_path = :r_path), :path)
-                """
-                    ),
-                    {
-                        "catch_id": catchment_raster_id,
-                        "r_path": catchment_path.replace("gw_catchments", "rem_zeroed"),
-                        "path": catchment_path,
-                    },
-                )
-
-    def load_hydrotables(self, catchment_dir, catchment_id):
-        """Load hydrotable CSVs with proper version handling"""
-        print("  Loading hydrotables...")
-        csv_files = self._get_files(catchment_dir, ".csv", "hydroTable_")
-
-        for csv_path in csv_files:
-            df = self._read_csv(csv_path)
-            self._insert_hydro_records(df, catchment_id)
-
-    def _insert_hydro_records(self, df, catchment_id):
-        """Batch insert hydrotable records"""
-        with self.engine.begin() as conn:
-            for _, row in df.iterrows():
-                conn.execute(
-                    text(
-                        """
-                        INSERT INTO Hydrotables (
-                            catchment_id, hand_version_id, HydroID, nwm_version_id,
-                            nwm_feature_id, order_id, number_of_cells, surface_area_m2,
-                            bed_area_m2, top_width_m, length_km, area_sq_km,
-                            wetted_perimeter_m, hydraulic_radius_m, wet_area_m2,
-                            volume_m3, slope, manning_n, stage, discharge_cms,
-                            default_discharge_cms, default_volume_m3, default_wet_area_m2,
-                            default_hydraulic_radius_m, default_manning_n,
-                            bathymetry_source, subdiv_applied, overbank_n, channel_n,
-                            subdiv_discharge_cms, calb_applied, lake_id
-                        ) VALUES (
-                            :catch_id, :hand_id, :hydro_id, :nwm_ver, :feat_id,
-                            :order_id, :num_cells, :surf_area, :bed_area, :top_width,
-                            :length, :area, :wet_perim, :hydraulic_r, :wet_area,
-                            :volume, :slope, :manning_n, :stage, :discharge,
-                            :def_discharge, :def_volume, :def_wet_area,
-                            :def_hydraulic_r, :def_manning_n, :bath_source,
-                            :subdiv_applied, :overbank_n, :channel_n,
-                            :subdiv_discharge, :calb_applied, :lake_id
-                        )
-                    """
-                    ),
-                    self._prepare_hydro_params(row, catchment_id),
-                )
-
-    def _prepare_hydro_params(self, row, catchment_id):
-        """Prepare parameters for hydrotable insert"""
-        return {
-            "catch_id": catchment_id,
-            "hand_id": self.hand_version_id,
-            "hydro_id": row["HydroID"],
-            "nwm_ver": self.nwm_version_id,
-            "feat_id": row.get("feature_id"),
-            "order_id": row.get("order", 0),
-            "num_cells": row.get("Number of Cells", 0),
-            "surf_area": row.get("SurfaceArea (m2)"),
-            "bed_area": row.get("BedArea (m2)"),
-            "top_width": row.get("TopWidth (m)"),
-            "length": row.get("LENGTHKM"),
-            "area": row.get("AREASQKM"),
-            "wet_perim": row.get("WettedPerimeter (m)"),
-            "hydraulic_r": row.get("HydraulicRadius (m)"),
-            "wet_area": row.get("WetArea (m2)"),
-            "volume": row.get("Volume (m3)"),
-            "slope": row.get("SLOPE"),
-            "manning_n": row.get("ManningN"),
-            "stage": row.get("stage"),
-            "discharge": row.get("discharge_cms"),
-            "def_discharge": row.get("default_discharge_cms"),
-            "def_volume": row.get("default_Volume (m3)"),
-            "def_wet_area": row.get("default_WetArea (m2)"),
-            "def_hydraulic_r": row.get("default_HydraulicRadius (m)"),
-            "def_manning_n": row.get("default_ManningN"),
-            "bath_source": row.get("Bathymetry_source"),
-            "subdiv_applied": row.get("subdiv_applied", False),
-            "overbank_n": row.get("overbank_n"),
-            "channel_n": row.get("channel_n"),
-            "subdiv_discharge": row.get("subdiv_discharge_cms"),
-            "calb_applied": row.get("calb_applied", False),
-            "lake_id": row.get("LakeID"),
-        }
-
-    def load_rasters(self, catchment_dir, catchment_id):
-        """Load all raster data types"""
-        print("  Loading REM rasters...")
-        rem_files = self._get_files(catchment_dir, ".tif", "rem_zeroed_")
-        self._insert_rasters(rem_files, catchment_id, "HAND_REM_Rasters")
-
-    def _insert_rasters(self, files, catchment_id, table_name):
-        """Generic raster insertion method"""
-        with self.engine.begin() as conn:
-            for file_path in files:
-                file_id = self._generate_uuid(file_path)
-                conn.execute(
-                    text(
-                        f"""
-                        INSERT INTO {table_name}
-                        (rem_raster_id, catchment_id, hand_version_id, raster_path)
-                        VALUES (:id, :catch_id, :version, :path)
-                    """
-                    ),
-                    {
-                        "id": file_id,
-                        "catch_id": catchment_id,
-                        "version": self.hand_version_id,
-                        "path": file_path,
-                    },
-                )
-
-    # Helper methods
     def _generate_uuid(self, input_str):
         """Generate a UUID from an input string."""
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, input_str))
