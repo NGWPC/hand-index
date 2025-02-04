@@ -3,7 +3,10 @@ WITH intersecting_catchments AS (
     FROM Catchments c
     WHERE ST_Intersects(
         c.geometry, 
-        ST_SetSRID(ST_GeomFromText(:'polygon'), :srid)
+        ST_Transform(
+            ST_SetSRID(ST_GeomFromText(:'polygon'), :srid),
+            ST_SRID(c.geometry)
+        )
     )
 ),
 hydrotable_arrays AS (
