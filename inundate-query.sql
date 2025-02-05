@@ -33,17 +33,16 @@ SELECT jsonb_pretty(
                     WHERE h.catchment_id = c.catchment_id
                 ), '{}'::jsonb),
                 'raster_pairs', COALESCE((
-                    SELECT jsonb_agg(
-                        jsonb_build_object(
-                            'rem_raster_path', r.raster_path,
-                            'catchment_raster_path', cr.raster_path
-                        )
+                    SELECT jsonb_build_object(
+                        'rem_raster_path', r.raster_path,
+                        'catchment_raster_path', cr.raster_path
                     )
                     FROM HAND_REM_Rasters r
                     LEFT JOIN HAND_Catchment_Rasters cr ON r.rem_raster_id = cr.rem_raster_id
                     WHERE r.catchment_id = c.catchment_id
                     AND r.hand_version_id = :'hand_version'
-                ), '[]'::jsonb)
+                    LIMIT 1
+                ), '{}'::jsonb)
             )
         ), '{}'::jsonb)
     )
