@@ -386,22 +386,38 @@ class DatabaseLoader:
             print("  No REM raster files found")
             return
 
+        print("  Loading catchment rasters...")
+        catchment_files = self._get_files(catchment_dir, ".tif", "gw_catchments")
+
         try:
-            self._insert_rasters(
-                rem_files, catchment_id, "HAND_REM_Rasters", transaction
+            # First insert REM rasters and get their IDs
+            rem_raster_ids = self._insert_rem_rasters(
+                rem_files, catchment_id, transaction
             )
+
+            # Then insert catchment rasters with their corresponding REM raster IDs
+            if catchment_files:
+                self._insert_catchment_rasters(
+                    catchment_files, rem_raster_ids, transaction
+                )
+            else:
+                print("  No catchment raster files found")
+
         except Exception as e:
             print(f"  Error processing rasters: {str(e)}")
             raise
 
-    def _insert_rasters(self, files, catchment_id, table_name, transaction):
-        """Generic raster insertion method with transaction support"""
+    def _insert_rem_rasters(self, files, catchment_id, transaction):
+        """Insert REM rasters and return their IDs"""
+        rem_raster_ids = []
         for file_path in files:
             file_id = self._generate_uuid(file_path)
+            rem_raster_ids.append(file_id)
+
             transaction.execute(
                 text(
-                    f"""
-                    INSERT INTO {table_name}
+                    """
+                    INSERT INTO HAND_REM_Rasters
                     (rem_raster_id, catchment_id, hand_version_id, raster_path)
                     VALUES (:id, :catch_id, :version, :path)
                 """
@@ -413,6 +429,32 @@ class DatabaseLoader:
                     "path": file_path,
                 },
             )
+        return rem_raster_ids
+
+    def _insert_catchment_rasters(self, files, rem_raster_ids, transaction):
+        """Insert catchment rasters linking them to REM rasters"""
+        for file_path in files:
+            # Generate a unique ID for the catchment raster
+            catchment_raster_id = self._generate_uuid(file_path)
+
+            # For each catchment raster, we need to link it to a REM raster
+            # Here we're assuming a 1:1 relationship and using the first REM raster ID
+            # Modify this logic if there's a specific mapping between REM and catchment rasters
+            if rem_raster_ids:
+                transaction.execute(
+                    text(
+                        """
+                        INSERT INTO HAND_Catchment_Rasters
+                        (catchment_raster_id, rem_raster_id, raster_path)
+                        VALUES (:id, :rem_id, :path)
+                    """
+                    ),
+                    {
+                        "id": catchment_raster_id,
+                        "rem_id": rem_raster_ids[0],  # Using first REM raster ID
+                        "path": file_path,
+                    },
+                )
 
     def load_nwm_lakes(self, gpkg_path):
         """Load NWM lakes from GeoPackage (local or S3)."""
