@@ -15,7 +15,8 @@ hydrotable_arrays AS (
         h.HydroID,
         jsonb_build_object(
             'stage', array_agg(stage ORDER BY stage),
-            'discharge_cms', array_agg(discharge_cms ORDER BY stage)
+            'discharge_cms', array_agg(discharge_cms ORDER BY stage),
+            'lake_id', MIN(lake_id)::integer  -- Cast to integer
         ) as hydro_data
     FROM Hydrotables h
     WHERE h.hand_version_id = :'hand_version'
