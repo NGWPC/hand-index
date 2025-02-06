@@ -34,7 +34,7 @@ SELECT jsonb_pretty(
                     FROM hydrotable_arrays h
                     WHERE h.catchment_id = c.catchment_id
                 ), '{}'::jsonb),
-                'raster_pairs', COALESCE((
+                'raster_pair', COALESCE((
                     SELECT jsonb_build_object(
                         'rem_raster_path', r.raster_path,
                         'catchment_raster_path', cr.raster_path
