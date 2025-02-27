@@ -99,11 +99,23 @@ CREATE TABLE Hydrotables (
     PRIMARY KEY (catchment_id, hand_version_id, HydroID, stage)
 );
 
+-- Store benchmark geometries only once
+CREATE TABLE Benchmarks (
+    benchmark_id UUID PRIMARY KEY,
+    geometry GEOMETRY,
+    source TEXT,
+    description TEXT,
+    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(geometry) IN ('ST_MultiPolygon', 'ST_Polygon'))
+);
+
+-- Junction table for the many-to-many relationship
 CREATE TABLE Benchmark_Catchment_Relations (
     relation_id UUID PRIMARY KEY,
-    benchmark_geom GEOMETRY,
+    benchmark_id UUID REFERENCES Benchmarks(benchmark_id),
     catchment_id UUID REFERENCES Catchments(catchment_id),
-    CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(benchmark_geom) IN ('ST_MultiPolygon', 'ST_Polygon'))
+    relation_type TEXT, -- Optional: can indicate the type of spatial relationship (contains, intersects, etc.)
+    intersection_area DECIMAL -- Optional: can store the area of intersection
 );
 
 CREATE TABLE HAND_REM_Rasters (
@@ -124,8 +136,7 @@ CREATE TABLE HAND_Catchment_Rasters (
 CREATE TABLE Metrics (
     metric_id UUID PRIMARY KEY,
     hand_version_id TEXT REFERENCES Hand_Versions(hand_version_id),
-    relation_id UUID REFERENCES Benchmark_Catchment_Relations(relation_id),
-    benchmark_geom GEOMETRY,
+    benchmark_id UUID REFERENCES Benchmarks(benchmark_id), -- Changed to reference Benchmarks
     ver_env TEXT,
     lid TEXT,
     magnitude TEXT,
@@ -134,12 +145,13 @@ CREATE TABLE Metrics (
     calibrated BOOLEAN,
     false_negatives_count INTEGER,
     ACC DECIMAL,
-    OTHER_METRICS TEXT,
-    CONSTRAINT enforce_geom_type CHECK (ST_GeometryType(benchmark_geom) IN ('ST_MultiPolygon', 'ST_Polygon'))
+    OTHER_METRICS TEXT
 );
 
 -- Create indexes
 CREATE INDEX idx_hydrotables_nwm_feature ON Hydrotables(nwm_feature_id, nwm_version_id);
+CREATE INDEX idx_benchmark_catchment_benchmark_id ON Benchmark_Catchment_Relations(benchmark_id);
+CREATE INDEX idx_benchmark_catchment_catchment_id ON Benchmark_Catchment_Relations(catchment_id);
 
 -- Create spatial indexes
 CREATE INDEX idx_catchments_geometry ON Catchments USING GIST (geometry);
@@ -147,5 +159,4 @@ CREATE INDEX idx_nwm_features_geometry ON NWM_Features USING GIST (geometry);
 CREATE INDEX idx_nwm_lakes_geometry ON NWM_Lakes USING GIST (geometry);
 CREATE INDEX idx_levees_geometry ON Levees USING GIST (geometry);
 CREATE INDEX idx_hucs_geometry ON HUCS USING GIST (geometry);
-CREATE INDEX idx_benchmark_catchment_relations_geometry ON Benchmark_Catchment_Relations USING GIST (benchmark_geom);
-CREATE INDEX idx_metrics_geometry ON Metrics USING GIST (benchmark_geom);
+CREATE INDEX idx_benchmarks_geometry ON Benchmarks USING GIST (geometry);
