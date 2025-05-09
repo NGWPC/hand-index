@@ -3,11 +3,8 @@ import os
 import json
 import uuid
 import geopandas as gpd
-import rasterio
-import hashlib
 import pandas as pd
 from pathlib import Path
-import sqlite3
 from sqlalchemy import create_engine, text
 from sqlalchemy.dialects.postgresql import UUID
 from datetime import datetime
@@ -85,7 +82,7 @@ class DatabaseLoader:
                     if (
                         part.isdigit()
                         and len(part) == 8
-                        and i + 1 < len(parts)
+                        and i + 2 < len(parts)
                         and parts[i + 1] == "branches"
                     ):
                         # Get the directory path up to and including the catchment directory
@@ -199,6 +196,7 @@ class DatabaseLoader:
                         print(
                             f"  Skipping catchment {catchment_dir} - No valid geometry found"
                         )
+                        transaction.rollback()
                         continue
 
                     self.load_hydrotables(catchment_dir, catchment_id, transaction)
@@ -217,12 +215,27 @@ class DatabaseLoader:
 
         print(f"  Cleaning up data for catchment {catchment_id}")
         with self.engine.begin() as conn:
-            # Delete from all related tables in reverse order of dependencies
+            # Delete in correct order to respect foreign key constraints
             conn.execute(
                 text(
                     """
                     DELETE FROM Hydrotables 
                     WHERE catchment_id = :catch_id AND hand_version_id = :hand_id
+                """
+                ),
+                {"catch_id": catchment_id, "hand_id": self.hand_version_id},
+            )
+
+            conn.execute(
+                text(
+                    """
+                    DELETE FROM HAND_Catchment_Rasters
+                    WHERE rem_raster_id IN (
+                        SELECT rem_raster_id 
+                        FROM HAND_REM_Rasters 
+                        WHERE catchment_id = :catch_id 
+                        AND hand_version_id = :hand_id
+                    )
                 """
                 ),
                 {"catch_id": catchment_id, "hand_id": self.hand_version_id},
@@ -272,12 +285,16 @@ class DatabaseLoader:
         if merged_geom is None:
             return None
 
-        catchment_id = self._generate_uuid(str(merged_geom.wkt))
+        # Include hand_version_id and catchment geometry in UUID generation
+        unique_string = f"{self.hand_version_id}:{merged_geom.wkt}"
+        catchment_id = self._generate_uuid(unique_string)
+
         transaction.execute(
             text(
                 """
                 INSERT INTO Catchments (catchment_id, hand_version_id, geometry)
                 VALUES (:catch_id, :hand_id, ST_GeomFromText(:geom, 5070))
+                ON CONFLICT (catchment_id) DO NOTHING
             """
             ),
             {
@@ -300,82 +317,156 @@ class DatabaseLoader:
         for csv_path in csv_files:
             try:
                 df = self._read_csv(csv_path)
-                self._insert_hydro_records(df, catchment_id, transaction)
+                if df.empty:
+                    print(f"    CSV file {csv_path} is empty. Skipping.")
+                    continue
+
+                required_cols = [
+                    "HydroID",
+                    "feature_id",
+                    "HUC",
+                    "LakeID",
+                    "stage",
+                    "discharge_cms",
+                ]
+                missing_cols = [col for col in required_cols if col not in df.columns]
+                if missing_cols:
+                    print(
+                        f"    Skipping {csv_path} due to missing required columns: {', '.join(missing_cols)}"
+                    )
+                    continue
+
+                df["stage"] = pd.to_numeric(df["stage"], errors="coerce")
+                df["discharge_cms"] = pd.to_numeric(
+                    df["discharge_cms"], errors="coerce"
+                )
+
+                # feature_id is used for nwm_feature_id which is BIGINT
+                df["feature_id"] = pd.to_numeric(df["feature_id"], errors="coerce")
+
+                # Ensure grouping keys are treated as strings where appropriate before taking 'first'
+                df["HydroID"] = df["HydroID"].astype(str)
+                # For HUC and LakeID, they will be converted to string after 'first' aggregation
+                # For feature_id, it's numeric.
+
+                # --- MODIFICATION FOR NEW PK ---
+                # Group by HydroID. For other identifying columns (feature_id, HUC, LakeID),
+                # take the first non-null value. This assumes that within a CSV for a given HydroID,
+                # these other identifiers should ideally be consistent. If not, this strategy picks one.
+                def first_not_null(series):
+                    # Pandas 1.x: series.dropna().iloc[0] if not series.dropna().empty else None
+                    # Pandas 2.x: series.dropna().iat[0] if not series.dropna().empty else None
+                    # Using a more compatible way for older pandas if needed:
+                    valid_values = series.dropna()
+                    return valid_values.iloc[0] if not valid_values.empty else None
+
+                grouped = (
+                    df.groupby("HydroID")
+                    .agg(
+                        # For columns that become single values in the DB row
+                        nwm_feature_id_agg=("feature_id", first_not_null),
+                        huc_id_agg=("HUC", first_not_null),
+                        lake_id_agg=("LakeID", first_not_null),
+                        # For columns that become arrays
+                        stage_list=("stage", lambda x: sorted(list(x.dropna()))),
+                        discharge_cms_list=(
+                            "discharge_cms",
+                            lambda x: list(x.dropna()),
+                        ),
+                    )
+                    .reset_index()
+                )  # HydroID becomes a column again
+
+                # Ensure correct types for aggregated single-value columns before insertion
+                grouped["nwm_feature_id_agg"] = pd.to_numeric(
+                    grouped["nwm_feature_id_agg"], errors="coerce"
+                ).astype(
+                    "Int64"
+                )  # Allows <NA>
+                grouped["huc_id_agg"] = (
+                    grouped["huc_id_agg"]
+                    .astype(str)
+                    .replace("nan", pd.NA)
+                    .replace("None", pd.NA)
+                )
+                grouped["lake_id_agg"] = (
+                    grouped["lake_id_agg"]
+                    .astype(str)
+                    .replace("nan", pd.NA)
+                    .replace("None", pd.NA)
+                )
+                # --- END MODIFICATION ---
+
+                self._insert_aggregated_hydro_records(
+                    grouped, catchment_id, transaction
+                )
+
             except Exception as e:
                 print(f"  Error processing hydrotable {csv_path}: {str(e)}")
                 raise
 
-    def _insert_hydro_records(self, df, catchment_id, transaction):
-        """Batch insert hydrotable records using transaction"""
-        for _, row in df.iterrows():
-            transaction.execute(
-                text(
-                    """
-                    INSERT INTO Hydrotables (
-                        catchment_id, hand_version_id, HydroID, nwm_version_id,
-                        nwm_feature_id, order_id, number_of_cells, surface_area_m2,
-                        bed_area_m2, top_width_m, length_km, area_sq_km,
-                        wetted_perimeter_m, hydraulic_radius_m, wet_area_m2,
-                        volume_m3, slope, manning_n, stage, discharge_cms,
-                        default_discharge_cms, default_volume_m3, default_wet_area_m2,
-                        default_hydraulic_radius_m, default_manning_n,
-                        bathymetry_source, subdiv_applied, overbank_n, channel_n,
-                        subdiv_discharge_cms, calb_applied, lake_id
-                    ) VALUES (
-                        :catch_id, :hand_id, :hydro_id, :nwm_ver, :feat_id,
-                        :order_id, :num_cells, :surf_area, :bed_area, :top_width,
-                        :length, :area, :wet_perim, :hydraulic_r, :wet_area,
-                        :volume, :slope, :manning_n, :stage, :discharge,
-                        :def_discharge, :def_volume, :def_wet_area,
-                        :def_hydraulic_r, :def_manning_n, :bath_source,
-                        :subdiv_applied, :overbank_n, :channel_n,
-                        :subdiv_discharge, :calb_applied, :lake_id
-                    )
-                """
+    def _insert_aggregated_hydro_records(
+        self, aggregated_df, catchment_id, transaction
+    ):
+        """Insert aggregated hydrotable records."""
+        print(f"    Inserting {len(aggregated_df)} aggregated hydrotable records...")
+        for _, row in aggregated_df.iterrows():
+            if (
+                not row["stage_list"] and not row["discharge_cms_list"]
+            ):  # Allow if one is empty but not both, or adjust as needed
+                print(
+                    f"    Skipping record for HydroID {row['HydroID']} due to empty stage and discharge lists after aggregation."
+                )
+                continue
+
+            params = {
+                "catch_id": catchment_id,
+                "hand_id": self.hand_version_id,
+                "hydro_id": str(row["HydroID"]),
+                "nwm_ver": self.nwm_version_id,  # NWM version for the run
+                "feat_id": (
+                    row["nwm_feature_id_agg"]
+                    if pd.notna(row["nwm_feature_id_agg"])
+                    else None
                 ),
-                self._prepare_hydro_params(row, catchment_id),
-            )
-
-    def _prepare_hydro_params(self, row, catchment_id):
-        """Prepare parameters for hydrotable insert with proper null handling"""
-
-        def safe_get(key, default=None):
-            return row.get(key, default) if key in row else default
-
-        return {
-            "catch_id": catchment_id,
-            "hand_id": self.hand_version_id,
-            "hydro_id": safe_get("HydroID"),
-            "nwm_ver": self.nwm_version_id,
-            "feat_id": safe_get("feature_id"),
-            "order_id": safe_get("order", 0),
-            "num_cells": safe_get("Number of Cells", 0),
-            "surf_area": safe_get("SurfaceArea (m2)"),
-            "bed_area": safe_get("BedArea (m2)"),
-            "top_width": safe_get("TopWidth (m)"),
-            "length": safe_get("LENGTHKM"),
-            "area": safe_get("AREASQKM"),
-            "wet_perim": safe_get("WettedPerimeter (m)"),
-            "hydraulic_r": safe_get("HydraulicRadius (m)"),
-            "wet_area": safe_get("WetArea (m2)"),
-            "volume": safe_get("Volume (m3)"),
-            "slope": safe_get("SLOPE"),
-            "manning_n": safe_get("ManningN"),
-            "stage": safe_get("stage"),
-            "discharge": safe_get("discharge_cms"),
-            "def_discharge": safe_get("default_discharge_cms"),
-            "def_volume": safe_get("default_Volume (m3)"),
-            "def_wet_area": safe_get("default_WetArea (m2)"),
-            "def_hydraulic_r": safe_get("default_HydraulicRadius (m)"),
-            "def_manning_n": safe_get("default_ManningN"),
-            "bath_source": safe_get("Bathymetry_source"),
-            "subdiv_applied": safe_get("subdiv_applied", False),
-            "overbank_n": safe_get("overbank_n"),
-            "channel_n": safe_get("channel_n"),
-            "subdiv_discharge": safe_get("subdiv_discharge_cms"),
-            "calb_applied": safe_get("calb_applied", False),
-            "lake_id": safe_get("LakeID"),
-        }
+                "huc_id_val": (
+                    str(row["huc_id_agg"]) if pd.notna(row["huc_id_agg"]) else None
+                ),
+                "lake_id_val": (
+                    str(row["lake_id_agg"]) if pd.notna(row["lake_id_agg"]) else None
+                ),
+                "stage_list": [float(s) for s in row["stage_list"]],
+                "discharge_list": [float(d) for d in row["discharge_cms_list"]],
+            }
+            try:
+                transaction.execute(
+                    text(
+                        """
+                        INSERT INTO Hydrotables (
+                            catchment_id, hand_version_id, HydroID, nwm_version_id,
+                                nwm_feature_id, stage, discharge_cms, huc_id, lake_id
+                        ) VALUES (
+                            :catch_id, :hand_id, :hydro_id, :nwm_ver, :feat_id,
+                                :stage_list, :discharge_list, :huc_id_val, :lake_id_val
+                        )
+                            ON CONFLICT (catchment_id, hand_version_id, HydroID) 
+                            DO UPDATE SET 
+                                nwm_version_id = EXCLUDED.nwm_version_id,
+                                nwm_feature_id = EXCLUDED.nwm_feature_id,
+                                stage = EXCLUDED.stage,
+                                discharge_cms = EXCLUDED.discharge_cms,
+                                huc_id = EXCLUDED.huc_id,
+                                lake_id = EXCLUDED.lake_id;
+                    """
+                    ),
+                    params,
+                )
+            except Exception as e:
+                print(
+                    f"    Error inserting aggregated hydro record for HydroID {row['HydroID']}: {str(e)}"
+                )
+                print(f"    Problematic params: {params}")
+                raise
 
     def load_rasters(self, catchment_dir, catchment_id, transaction):
         """Load all raster data types with error handling"""
