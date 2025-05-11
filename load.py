@@ -7,6 +7,9 @@ import uuid as py_uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Type
+import concurrent.futures
+from pyogrio.errors import DataSourceError
+import fiona
 
 import pandas as pd
 import geopandas as gpd
@@ -23,6 +26,7 @@ with open(SCHEMA_PATH) as f:
     SCHEMA = yaml.safe_load(f)
 
 PARENT_KEYS: Dict[str, Set[Any]] = {}
+TMP = tempfile.TemporaryDirectory()
 
 
 # Type‐conversion helpers
@@ -63,7 +67,7 @@ TYPE_MAPPING = {
 
 # Build Pydantic models dynamically
 def build_models(schema: Dict) -> Dict[str, Type[BaseModel]]:
-    models = {}
+    models: Dict[str, Type[BaseModel]] = {}
     for tbl, tbl_def in schema["tables"].items():
         fields: Dict[str, Tuple[Any, Any]] = {}
         for col, props in tbl_def["columns"].items():
@@ -74,7 +78,7 @@ def build_models(schema: Dict) -> Dict[str, Type[BaseModel]]:
             # force required if not nullable and no default
             if not props.get("nullable", True) and default is None:
                 default = ...
-            extras = {}
+            extras: Dict[str, Any] = {}
             if props.get("primary_key"):
                 extras["primary_key"] = True
             if props.get("foreign_key"):
@@ -106,6 +110,7 @@ def register_parent_keys(df: pd.DataFrame, tbl: str):
     if not pk_cols:
         return
 
+    key: str
     if len(pk_cols) == 1:
         c = pk_cols[0]
         vals = set(df[c].dropna().tolist())
@@ -124,7 +129,7 @@ def register_parent_keys(df: pd.DataFrame, tbl: str):
 def generic_validate_and_write(
     records: List[Dict[str, Any]],
     tbl: str,
-    outdir: Path,
+    outdir: str,
     is_geo: bool = False,
     crs: Optional[str] = None,
 ):
@@ -146,6 +151,7 @@ def generic_validate_and_write(
         try:
             inst = Model(**rec)
             row = inst.model_dump(exclude_none=True)
+            # retain shapely geometry if present
             if "geometry" in rec:
                 row["geometry"] = rec["geometry"]
             valid.append(row)
@@ -159,45 +165,53 @@ def generic_validate_and_write(
         return
 
     df = pd.DataFrame(valid)
-    if is_geo and "geometry" in df.columns:
-        gdf = gpd.GeoDataFrame(df, geometry="geometry", crs=crs or "EPSG:5070")
-        table = pa.Table.from_pandas(gdf, preserve_index=False)
-    else:
-        table = pa.Table.from_pandas(df, preserve_index=False)
 
-    existing = table.schema.metadata or {}
-    meta = {
-        b"custom_schema_name": SCHEMA["schema_name"].encode(),
-        b"custom_schema_version": SCHEMA["schema_version"].encode(),
-        b"custom_yaml_schema_src": Path(SCHEMA_PATH).name.encode(),
-    }
-    new_schema = table.schema.with_metadata({**existing, **meta})
-    # build the target URI (either "file:///…" or "s3://…")
+    # convert all UUID columns to strings
+    for col, props in SCHEMA["tables"][tbl]["columns"].items():
+        if props["type"] == "UUID" and col in df:
+            df[col] = df[col].astype(str)
+
     fn = SCHEMA["tables"][tbl]["file_path"]
-    target = f"{outdir.rstrip('/')}/{fn}"
-    fs, path = fsspec.core.url_to_fs(target)
-    with fs.open(path, "wb") as f:
-        pq.write_table(table.cast(new_schema), f, compression="snappy")
+    target_uri = f"{outdir.rstrip('/')}/{fn}"
 
-    fs, path = fsspec.core.url_to_fs(target)
-    # open an S3 (or local) file and write the parquet bytes
-    with fs.open(path, "wb") as f:
-        pq.write_table(table.cast(new_schema), f, compression="snappy")
-    print(f"wrote {len(valid)} rows → {tbl}")
+    fs, anon = fsspec.core.url_to_fs(target_uri)
+    with fs.open(anon, "wb") as out_f:
+        if is_geo and "geometry" in df.columns:
+            # Build GeoDataFrame
+            gdf = gpd.GeoDataFrame(df, geometry="geometry", crs=crs or "EPSG:5070")
 
-    register_parent_keys(gdf if is_geo and "geometry" in df.columns else df, tbl)
+            # True GeoParquet write (injects GeoParquet metadata)
+            # Pass the opened file‐handle directly
+            gdf.to_parquet(
+                out_f,
+                engine="pyarrow",
+                compression="snappy",
+                index=False,
+            )
+            register_parent_keys(gdf, tbl)
+            print(f"wrote {len(valid)} rows → {tbl} (GeoParquet)")
+
+        else:
+            # Plain Parquet: build Arrow table, attach custom metadata, then write
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            existing = table.schema.metadata or {}
+            meta = {
+                b"custom_schema_name": SCHEMA["schema_name"].encode(),
+                b"custom_schema_version": SCHEMA["schema_version"].encode(),
+                b"custom_yaml_schema_src": Path(SCHEMA_PATH).name.encode(),
+            }
+            new_schema = table.schema.with_metadata({**existing, **meta})
+
+            pq.write_table(table.cast(new_schema), out_f, compression="snappy")
+            register_parent_keys(df, tbl)
+            print(f"wrote {len(valid)} rows → {tbl} (Parquet)")
 
 
-# if path is S3, download to a temp dir
-TMP = tempfile.TemporaryDirectory()
-
-
+# If the path is S3, pull it down once into TMP and return a local path
 def fetch_local(path: str) -> str:
-    """If `path` starts with s3://, pull it down once into TMP and return local path."""
     low = path.lower()
-    if low.startswith("s3://") or low.startswith("s3a://"):
+    if low.startswith(("s3://", "s3a://")):
         fs, anon_path = fsspec.core.url_to_fs(path)
-        # internal path e.g. "bucket/key/to/file.gpkg"
         name = Path(anon_path).name
         local = Path(TMP.name) / name
         if not local.exists():
@@ -208,22 +222,17 @@ def fetch_local(path: str) -> str:
         return path
 
 
-# Walk branch dirs in local or S3
 def list_branch_dirs(hand_dir: str) -> List[str]:
     fs, root = fsspec.core.url_to_fs(hand_dir)
     scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
     branches: List[str] = []
-
-    # list all HUC8 directories under root
     for info in fs.ls(root, detail=True):
         if info["type"] != "directory":
             continue
         huc8 = info["name"]
-        br_root = f"{huc8}/branches"
-        # does branches/ exist?
+        br_root = f"{info['name']}/branches"
         if not fs.exists(br_root):
             continue
-        # list each sub‐branch
         for sub in fs.ls(br_root, detail=True):
             if sub["type"] == "directory":
                 uri = f"{scheme}://{sub['name']}" if scheme != "file" else sub["name"]
@@ -231,182 +240,241 @@ def list_branch_dirs(hand_dir: str) -> List[str]:
     return branches
 
 
-# Load HAND suite from local or S3
-def load_hand_suite(
-    outdir: Path,
-    hand_dir: str,
-    hand_ver: str,
-    nwm_ver: Decimal,
-):
-    # find all branch folders
-    branch_dirs = list_branch_dirs(hand_dir)
+# Helper function to handle possible errors when using pyogrio to read gpkgs
+def read_gpkg_fallback(path: str) -> gpd.GeoDataFrame:
+    try:
+        # first try Pyogrio (the default in GeoPandas >=0.12)
+        return gpd.read_file(path)
+    except DataSourceError:
+        # fallback to Fiona with explicit driver
+        with fiona.open(path, driver="GPKG") as src:
+            return gpd.GeoDataFrame.from_features(src, crs=src.crs)
 
-    # 1) Catchments
-    catch_recs: List[Dict[str, Any]] = []
-    dir_to_id: Dict[str, py_uuid.UUID] = {}
-    catch_crs = None
 
-    for d in branch_dirs:
-        print(f"processing branch: {d}")
-        # glob remote or local GPKG
-        fs, anon = fsspec.core.url_to_fs(d)
-        pl = fs.glob(f"{anon}/*gw_catchments*.gpkg")
-        if not pl:
+def process_branch(args: Tuple[str, str, str]) -> Tuple[
+    Optional[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    Optional[str],
+]:
+    """
+    Process one branch directory. Returns:
+      - a single catchment record (or None if no catchments)
+      - list of hydro records
+      - list of rem raster records
+      - list of catchment raster records
+      - the CRS string for this branch's GPKG (or None)
+    """
+    d, hand_ver, nwm_ver_str = args
+    print(f"Processing branch: {d}")
+    nwm_ver = Decimal(nwm_ver_str)
+
+    catch_rec: Optional[Dict[str, Any]] = None
+    hydro_recs: List[Dict[str, Any]] = []
+    rem_recs: List[Dict[str, Any]] = []
+    cr_recs: List[Dict[str, Any]] = []
+    catch_crs: Optional[str] = None
+
+    # Catchment geometry union
+    fs, anon = fsspec.core.url_to_fs(d)
+    gpkg_list = fs.glob(f"{anon}/*gw_catchments*.gpkg")
+    geoms = []
+    for anon_fp in gpkg_list:
+        scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
+        uri = f"{scheme}://{anon_fp}" if scheme != "file" else anon_fp
+        loc = fetch_local(uri)
+        try:
+            gdf = read_gpkg_fallback(loc)
+        except Exception:
+            print(f"  ERROR: could not open {loc!r} as GPKG")
             continue
-
-        geoms = []
-        for anon_fp in pl:
-            scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
-            uri = f"{scheme}://{anon_fp}" if scheme != "file" else anon_fp
-            loc = fetch_local(uri)
-            gdf = gpd.read_file(loc)
-            if gdf.empty:
-                continue
-            catch_crs = catch_crs or gdf.crs
-            geoms.append(unary_union(gdf.geometry))
-
-        if not geoms:
+        if gdf.empty:
             continue
+        catch_crs = catch_crs or gdf.crs.to_string()
+        geoms.append(unary_union(gdf.geometry))
+
+    if geoms:
         merged = unary_union(geoms)
         cid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{hand_ver}:{merged.wkt}")
-        dir_to_id[d] = cid
-        catch_recs.append(
-            {
-                "catchment_id": cid,
-                "hand_version_id": hand_ver,
-                "geometry": merged,
-                "additional_attributes": None,
-            }
-        )
+        catch_rec = {
+            "catchment_id": cid,
+            "hand_version_id": hand_ver,
+            "geometry": merged,
+            "additional_attributes": None,
+        }
 
-    generic_validate_and_write(
-        catch_recs, "Catchments", outdir, is_geo=True, crs=catch_crs or "EPSG:5070"
-    )
+    # If no catchment, skip the rest
+    if catch_rec is None:
+        return None, [], [], [], None
 
-    valid_cids = PARENT_KEYS.get("Catchments.catchment_id", set())
-    branch_dirs = [d for d in branch_dirs if dir_to_id.get(d) in valid_cids]
-
-    # 2) Hydrotables
-    hydro_recs: List[Dict[str, Any]] = []
-    for d in branch_dirs:
-        fs, anon = fsspec.core.url_to_fs(d)
-        csvs = fs.glob(f"{anon}/hydroTable_*.csv")
-        if not csvs:
-            continue
-
-        # load each CSV into a single DF
+    # Hydrotable
+    csvs = fs.glob(f"{anon}/hydroTable_*.csv")
+    if csvs:
         pieces = []
         for anon_fp in csvs:
             scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
             uri = f"{scheme}://{anon_fp}" if scheme != "file" else anon_fp
             loc = fetch_local(uri)
+            info = fs.info(anon_fp)
+            try:
+                df_part = pd.read_csv(loc)
+            except Exception:
+                print(f"  skipping empty CSV: {uri}")
+                continue
             pieces.append(pd.read_csv(loc))
-        df = pd.concat(pieces, ignore_index=True)
+        if pieces:
+            df = pd.concat(pieces, ignore_index=True)
+            df["stage"] = pd.to_numeric(df["stage"], errors="coerce")
+            df["discharge_cms"] = pd.to_numeric(df["discharge_cms"], errors="coerce")
+            df["feature_id"] = pd.to_numeric(df["feature_id"], errors="coerce")
+            df["HydroID"] = df["HydroID"].astype(str)
 
-        # coerce
-        df["stage"] = pd.to_numeric(df["stage"], errors="coerce")
-        df["discharge_cms"] = pd.to_numeric(df["discharge_cms"], errors="coerce")
-        df["feature_id"] = pd.to_numeric(df["feature_id"], errors="coerce")
-        df["HydroID"] = df["HydroID"].astype(str)
+            def first_notnull(s):
+                return s.dropna().iloc[0] if not s.dropna().empty else None
 
-        def first_notnull(s):
-            return s.dropna().iloc[0] if not s.dropna().empty else None
-
-        grp = (
-            df.groupby("HydroID")
-            .agg(
-                nwm_feature_id_agg=("feature_id", first_notnull),
-                huc_id_agg=("HUC", first_notnull),
-                lake_id_agg=("LakeID", first_notnull),
-                stage_list=(
-                    "stage",
-                    lambda v: [to_decimal(x) for x in sorted(v.dropna())],
-                ),
-                discharge_list=(
-                    "discharge_cms",
-                    lambda v: [to_decimal(x) for x in v.dropna()],
-                ),
+            grp = (
+                df.groupby("HydroID")
+                .agg(
+                    nwm_feature_id_agg=("feature_id", first_notnull),
+                    huc_id_agg=("HUC", first_notnull),
+                    lake_id_agg=("LakeID", first_notnull),
+                    stage_list=(
+                        "stage",
+                        lambda v: [to_decimal(x) for x in sorted(v.dropna())],
+                    ),
+                    discharge_list=(
+                        "discharge_cms",
+                        lambda v: [to_decimal(x) for x in v.dropna()],
+                    ),
+                )
+                .reset_index()
             )
-            .reset_index()
+            for _, r in grp.iterrows():
+                hydro_recs.append(
+                    {
+                        "catchment_id": cid,
+                        "hand_version_id": hand_ver,
+                        "HydroID": r["HydroID"],
+                        "nwm_feature_id": (
+                            int(r["nwm_feature_id_agg"])
+                            if pd.notna(r["nwm_feature_id_agg"])
+                            else None
+                        ),
+                        "nwm_version_id": (
+                            nwm_ver if pd.notna(r["nwm_feature_id_agg"]) else None
+                        ),
+                        "stage": r["stage_list"],
+                        "discharge_cms": r["discharge_list"],
+                        "huc_id": (
+                            str(r["huc_id_agg"]) if pd.notna(r["huc_id_agg"]) else None
+                        ),
+                        "lake_id": (
+                            str(r["lake_id_agg"])
+                            if pd.notna(r["lake_id_agg"])
+                            else None
+                        ),
+                    }
+                )
+
+    # REM Raster
+    rem_ids: List[py_uuid.UUID] = []
+    rem_tifs = fs.glob(f"{anon}/*rem_zeroed*.tif")
+    if not rem_tifs:
+        print(f"WARNING: No REM rasters found in {anon}")
+    else:
+        if len(rem_tifs) > 1:
+            scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
+            uris = [f"{scheme}://{t}" if scheme != "file" else t for t in rem_tifs]
+            print(
+                f"WARNING: Multiple REM rasters found in {anon}:\n  "
+                + "\n  ".join(uris)
+            )
+        # Always use the first
+        rem_tif = rem_tifs[0]
+        scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
+        uri = f"{scheme}://{rem_tif}" if scheme != "file" else rem_tif
+        rid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{cid}:{Path(uri).name}")
+        rem_ids.append(rid)
+        rem_recs.append(
+            {
+                "rem_raster_id": rid,
+                "catchment_id": cid,
+                "hand_version_id": hand_ver,
+                "raster_path": uri,
+                "metadata": None,
+            }
         )
 
-        for _, r in grp.iterrows():
-            hydro_recs.append(
-                {
-                    "catchment_id": dir_to_id[d],
-                    "hand_version_id": hand_ver,
-                    "HydroID": r["HydroID"],
-                    "nwm_feature_id": (
-                        int(r["nwm_feature_id_agg"])
-                        if pd.notna(r["nwm_feature_id_agg"])
-                        else None
-                    ),
-                    "nwm_version_id": (
-                        nwm_ver if pd.notna(r["nwm_feature_id_agg"]) else None
-                    ),
-                    "stage": r["stage_list"],
-                    "discharge_cms": r["discharge_list"],
-                    "huc_id": (
-                        str(r["huc_id_agg"]) if pd.notna(r["huc_id_agg"]) else None
-                    ),
-                    "lake_id": (
-                        str(r["lake_id_agg"]) if pd.notna(r["lake_id_agg"]) else None
-                    ),
-                }
-            )
-
-    generic_validate_and_write(hydro_recs, "Hydrotables", outdir)
-
-    # 3) HAND_REM_Rasters
-    rem_recs: List[Dict[str, Any]] = []
-    rem_map: Dict[str, List[py_uuid.UUID]] = {}
-
-    for d in branch_dirs:
-        fs, anon = fsspec.core.url_to_fs(d)
-        tifs = fs.glob(f"{anon}/*rem_zeroed*.tif")
-        if not tifs:
-            continue
-
-        ids: List[py_uuid.UUID] = []
-        for anon_fp in tifs:
+    # Catchment Rasters
+    catch_tifs = fs.glob(f"{anon}/*gw_catchments_reaches*.tif")
+    if not catch_tifs:
+        print(f"WARNING: No catchment rasters found in {anon}")
+    elif rem_ids:
+        if len(catch_tifs) > 1:
             scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
-            uri = f"{scheme}://{anon_fp}" if scheme != "file" else anon_fp
-            rid = py_uuid.uuid5(
-                py_uuid.NAMESPACE_DNS, f"{dir_to_id[d]}:{Path(uri).name}"
-            )
-            ids.append(rid)
-            rem_recs.append(
-                {
-                    "rem_raster_id": rid,
-                    "catchment_id": dir_to_id[d],
-                    "hand_version_id": hand_ver,
-                    "raster_path": uri,
-                    "metadata": None,
-                }
-            )
-        rem_map[d] = ids
+            uris = [f"{scheme}://{t}" if scheme != "file" else t for t in catch_tifs]
+            # print(
+            #     f"WARNING: Multiple catchment rasters found in {anon}:\n  "
+            #     + "\n  ".join(uris)
+            # )
+        # Always use the first
+        catch_tif = catch_tifs[0]
+        scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
+        uri = f"{scheme}://{catch_tif}" if scheme != "file" else catch_tif
+        crid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{rem_ids[0]}:{Path(uri).name}")
+        cr_recs.append(
+            {
+                "catchment_raster_id": crid,
+                "rem_raster_id": rem_ids[0],
+                "raster_path": uri,
+                "metadata": None,
+            }
+        )
 
-    generic_validate_and_write(rem_recs, "HAND_REM_Rasters", outdir)
+    return catch_rec, hydro_recs, rem_recs, cr_recs, catch_crs
 
-    # 4) HAND_Catchment_Rasters
-    cr_recs: List[Dict[str, Any]] = []
-    for d, ids in rem_map.items():
-        first_rem = ids[0]
-        for anon_fp in fsspec.core.url_to_fs(d)[0].glob(
-            f"{fsspec.core.url_to_fs(d)[1]}/*gw_catchments*.tif"
-        ):
-            uri = f"{fsspec.core.url_to_fs(d)[0].protocol}://{anon_fp}"
-            cid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{first_rem}:{Path(uri).name}")
-            cr_recs.append(
-                {
-                    "catchment_raster_id": cid,
-                    "rem_raster_id": first_rem,
-                    "raster_path": uri,
-                    "metadata": None,
-                }
-            )
 
-    generic_validate_and_write(cr_recs, "HAND_Catchment_Rasters", outdir)
+def load_hand_suite(
+    outdir: str,
+    hand_dir: str,
+    hand_ver: str,
+    nwm_ver: Decimal,
+):
+    # 1) find all branch dirs once
+    branch_dirs = list_branch_dirs(hand_dir)
+    if not branch_dirs:
+        print("No branch directories found → exiting")
+        return
+
+    # 2) dispatch in parallel
+    args_list = [(d, hand_ver, str(nwm_ver)) for d in branch_dirs]
+    all_catch: List[Dict[str, Any]] = []
+    all_hydro: List[Dict[str, Any]] = []
+    all_rem: List[Dict[str, Any]] = []
+    all_cr: List[Dict[str, Any]] = []
+    catch_crs_list: List[str] = []
+
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        for catch_rec, hydro, rem, cr, crs in executor.map(process_branch, args_list):
+            if catch_rec:
+                all_catch.append(catch_rec)
+                if crs:
+                    catch_crs_list.append(crs)
+            all_hydro.extend(hydro)
+            all_rem.extend(rem)
+            all_cr.extend(cr)
+
+    # pick first CRS or default
+    catch_crs = catch_crs_list[0] if catch_crs_list else "EPSG:5070"
+
+    # 3) validate + write each table exactly once
+    generic_validate_and_write(
+        all_catch, "Catchments", outdir, is_geo=True, crs=catch_crs
+    )
+    generic_validate_and_write(all_hydro, "Hydrotables", outdir)
+    generic_validate_and_write(all_rem, "HAND_REM_Rasters", outdir)
+    generic_validate_and_write(all_cr, "HAND_Catchment_Rasters", outdir)
 
 
 def main():
@@ -426,18 +494,19 @@ def main():
     args = p.parse_args()
 
     outdir_uri = args.output_dir.rstrip("/")
-    # if this is a true URI (s3:// or s3a://) we do NOT mkdir() locally
     if outdir_uri.startswith(("s3://", "s3a://")):
         outdir = outdir_uri
     else:
-        outdir = Path(outdir_uri)
-        outdir.mkdir(parents=True, exist_ok=True)
-        outdir = str(outdir)
+        Path(outdir_uri).mkdir(parents=True, exist_ok=True)
+        outdir = outdir_uri
 
     hand_ver = args.hand_version
     nwm_ver = Decimal(args.nwm_version)
 
-    # enforce that the hand-version string appears somewhere in the output path
+    if hand_ver not in str(outdir):
+        p.error(
+            f"--hand-dir ('{args.hand_dir}') must contain the hand-version '{hand_ver}'"
+        )
     if hand_ver not in str(outdir):
         p.error(f"--output-dir ('{outdir}') must contain the hand-version '{hand_ver}'")
 
