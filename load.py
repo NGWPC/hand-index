@@ -1,706 +1,451 @@
-import pdb
-import os
-import json
-import uuid
-import geopandas as gpd
-import pandas as pd
-from pathlib import Path
-from sqlalchemy import create_engine, text
-from sqlalchemy.dialects.postgresql import UUID
-from datetime import datetime
-import boto3
-from urllib.parse import urlparse
+#!/usr/bin/env python3
+import argparse
 import tempfile
+import shutil
+import yaml
+import uuid as py_uuid
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Type
 
-# Initialize S3 client
-s3_client = boto3.client("s3")
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
+from pydantic import BaseModel, create_model, ValidationError, Field, ConfigDict
+import pyarrow as pa
+import pyarrow.parquet as pq
+import fsspec
+
+# Load your YAML schema
+SCHEMA_PATH = "./schema/hand-index-v0.1.yml"
+with open(SCHEMA_PATH) as f:
+    SCHEMA = yaml.safe_load(f)
+
+PARENT_KEYS: Dict[str, Set[Any]] = {}
 
 
-class DatabaseLoader:
-    def __init__(self, db_connection_string, hand_version_id, nwm_version_id):
-        """Initialize database connection with version IDs."""
-        self.engine = create_engine(db_connection_string)
-        self.hand_version_id = hand_version_id
-        self.nwm_version_id = nwm_version_id
-        self._initialize_hand_version()
+# Type‐conversion helpers
+def to_decimal(v: Any) -> Optional[Decimal]:
+    if v is None:
+        return None
+    try:
+        return Decimal(str(v))
+    except InvalidOperation:
+        return None
 
-    def _initialize_hand_version(self):
-        """Register hand version before processing data"""
-        with self.engine.begin() as conn:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO Hand_Versions (hand_version_id)
-                    VALUES (:version)
-                    ON CONFLICT (hand_version_id) DO NOTHING
-                """
-                ),
-                {"version": self.hand_version_id},
-            )
 
-    def is_s3_path(self, path):
-        """Check if a path is an S3 URI."""
-        return path.startswith("s3://")
+def to_uuid(v: Any) -> Optional[py_uuid.UUID]:
+    if v is None:
+        return None
+    if isinstance(v, py_uuid.UUID):
+        return v
+    try:
+        return py_uuid.UUID(str(v))
+    except ValueError:
+        return None
 
-    def parse_s3_path(self, s3_uri):
-        """Parse S3 URI into bucket and key."""
-        parsed = urlparse(s3_uri)
-        return parsed.netloc, parsed.path.lstrip("/")
 
-    def list_s3_objects(self, s3_prefix):
-        """List all objects in an S3 prefix/path."""
-        bucket, prefix = self.parse_s3_path(s3_prefix)
-        paginator = s3_client.get_paginator("list_objects_v2")
-        page_iterator = paginator.paginate(Bucket=bucket, Prefix=prefix)
-        objects = []
-        for page in page_iterator:
-            if "Contents" in page:
-                objects.extend([obj["Key"] for obj in page["Contents"]])
-        return objects
+# YAML to Python type map
+TYPE_MAPPING = {
+    "TEXT": (str, ...),
+    "INTEGER": (int, ...),
+    "BIGINT": (int, ...),
+    "DECIMAL": (Optional[Decimal], None),
+    "REAL": (Optional[float], None),
+    "BOOLEAN": (Optional[bool], None),
+    "UUID": (Optional[py_uuid.UUID], None),
+    "JSONB": (Optional[dict], None),
+    "GEOMETRY": (Optional[BaseGeometry], None),
+    "LIST_DECIMAL": (Optional[List[Decimal]], None),
+}
 
-    def download_s3_file(self, s3_uri, local_path):
-        """Download a file from S3 to local path."""
-        bucket, key = self.parse_s3_path(s3_uri)
-        s3_client.download_file(bucket, key, local_path)
 
-    def generate_deterministic_uuid(self, input_string):
-        """Generate a deterministic UUID from an input string."""
-        return str(uuid.uuid5(uuid.NAMESPACE_DNS, input_string))
-
-    def _get_catchment_dirs(self, base_dir):
-        """Get all catchment directories that are under HUC/branches/."""
-        if self.is_s3_path(base_dir):
-            # For S3, list all prefixes that could be catchment directories
-            objects = self.list_s3_objects(base_dir)
-            # Get unique catchment directories under HUC/branches/
-            dirs = set()
-
-            for obj in objects:
-                parts = obj.split("/")
-                # Look for the pattern: 8-digit-HUC/branches/catchment-dir/
-                for i, part in enumerate(parts[:-2]):
-                    if (
-                        part.isdigit()
-                        and len(part) == 8
-                        and i + 2 < len(parts)
-                        and parts[i + 1] == "branches"
-                    ):
-                        # Get the directory path up to and including the catchment directory
-                        catchment_path = "/".join(
-                            parts[: i + 3]
-                        )  # Include HUC, 'branches', and catchment dir
-                        if catchment_path:  # Only add if we have a catchment directory
-                            dirs.add(catchment_path)
-
-            # Convert to full S3 paths
-            bucket, _ = self.parse_s3_path(base_dir)
-            return [f"s3://{bucket}/{d}" for d in dirs]
-        else:
-            # For local filesystem
-            catchment_dirs = []
-            for d in os.listdir(base_dir):
-                huc_path = os.path.join(base_dir, d)
-                # Check if directory is 8 digits
-                if os.path.isdir(huc_path) and d.isdigit() and len(d) == 8:
-                    # Check for branches directory
-                    branches_path = os.path.join(huc_path, "branches")
-                    if os.path.isdir(branches_path):
-                        # Add all subdirectories under branches
-                        catchment_dirs.extend(
-                            [
-                                os.path.join(branches_path, cd)
-                                for cd in os.listdir(branches_path)
-                                if os.path.isdir(os.path.join(branches_path, cd))
-                            ]
-                        )
-            return catchment_dirs
-
-    def _get_files(self, directory, extension, pattern):
-        """Get all files matching extension and pattern in directory."""
-        if self.is_s3_path(directory):
-            objects = self.list_s3_objects(directory)
-            return [
-                f"s3://{self.parse_s3_path(directory)[0]}/{key}"
-                for key in objects
-                if key.endswith(extension) and pattern in key
-            ]
-        else:
-            return [
-                os.path.join(directory, f)
-                for f in os.listdir(directory)
-                if f.endswith(extension) and pattern in f
-            ]
-
-    def _download_if_s3(self, file_path, tmp_dir):
-        """Download file to temporary directory if it's an S3 path."""
-        if self.is_s3_path(file_path):
-            local_path = os.path.join(tmp_dir, os.path.basename(file_path))
-            self.download_s3_file(file_path, local_path)
-            return local_path
-        return file_path
-
-    def _merge_geometries(self, existing_geom, new_gdf):
-        """Merge geometries from a GeoDataFrame."""
-        if existing_geom is None:
-            return new_gdf.union_all()
-        return existing_geom.union(new_gdf.union_all())
-
-    def _read_csv(self, csv_path):
-        """Read CSV file from local or S3 path."""
-        if self.is_s3_path(csv_path):
-            with tempfile.NamedTemporaryFile() as tmp:
-                self.download_s3_file(csv_path, tmp.name)
-                return pd.read_csv(tmp.name)
-        return pd.read_csv(csv_path)
-
-    def load_general_data(self, general_dir):
-        """Load data from the general directory (local or S3)."""
-        print("Loading data from general directory...")
-
-        # List all objects/files in the general directory
-        if self.is_s3_path(general_dir):
-            files = [
-                f"s3://{self.parse_s3_path(general_dir)[0]}/{key}"
-                for key in self.list_s3_objects(general_dir)
-            ]
-        else:
-            files = [os.path.join(general_dir, f) for f in os.listdir(general_dir)]
-
-        # Process NWM lakes
-        self.load_nwm_lakes([f for f in files if "nwm_lakes" in f][0])
-
-        # Process HUCs
-        self.load_hucs([f for f in files if "WBD_National" in f][0])
-
-        # Process Levees
-        self.load_levees([f for f in files if "Levee_protected_areas" in f][0])
-
-        # Process NWM features
-        self.load_nwm_features([f for f in files if "nwm_flows" in f][0])
-
-    def load_hand_data(self, hand_dir):
-        """Main entry point for HAND data loading with error handling"""
-        catchment_dirs = self._get_catchment_dirs(hand_dir)
-        total = len(catchment_dirs)
-
-        print(f"Found {total} catchments to process")
-        for idx, catchment_dir in enumerate(catchment_dirs, 1):
-            print(f"\nProcessing catchment {idx}/{total}: {catchment_dir}")
-            try:
-                with self.engine.begin() as transaction:
-                    # All operations for this catchment will be in a single transaction
-                    catchment_id = self.load_catchment_geometry(
-                        catchment_dir, transaction
-                    )
-                    if catchment_id is None:
-                        print(
-                            f"  Skipping catchment {catchment_dir} - No valid geometry found"
-                        )
-                        transaction.rollback()
-                        continue
-
-                    self.load_hydrotables(catchment_dir, catchment_id, transaction)
-                    self.load_rasters(catchment_dir, catchment_id, transaction)
-
-            except Exception as e:
-                print(f"  Error processing catchment {catchment_dir}: {str(e)}")
-                # Transaction will automatically rollback due to the context manager
-                self._cleanup_catchment(catchment_id)
-                continue
-
-    def _cleanup_catchment(self, catchment_id):
-        """Clean up any data associated with a failed catchment load"""
-        if catchment_id is None:
-            return
-
-        print(f"  Cleaning up data for catchment {catchment_id}")
-        with self.engine.begin() as conn:
-            # Delete in correct order to respect foreign key constraints
-            conn.execute(
-                text(
-                    """
-                    DELETE FROM Hydrotables 
-                    WHERE catchment_id = :catch_id AND hand_version_id = :hand_id
-                """
-                ),
-                {"catch_id": catchment_id, "hand_id": self.hand_version_id},
-            )
-
-            conn.execute(
-                text(
-                    """
-                    DELETE FROM HAND_Catchment_Rasters
-                    WHERE rem_raster_id IN (
-                        SELECT rem_raster_id 
-                        FROM HAND_REM_Rasters 
-                        WHERE catchment_id = :catch_id 
-                        AND hand_version_id = :hand_id
-                    )
-                """
-                ),
-                {"catch_id": catchment_id, "hand_id": self.hand_version_id},
-            )
-
-            conn.execute(
-                text(
-                    """
-                    DELETE FROM HAND_REM_Rasters 
-                    WHERE catchment_id = :catch_id AND hand_version_id = :hand_id
-                """
-                ),
-                {"catch_id": catchment_id, "hand_id": self.hand_version_id},
-            )
-
-            conn.execute(
-                text(
-                    """
-                    DELETE FROM Catchments 
-                    WHERE catchment_id = :catch_id AND hand_version_id = :hand_id
-                """
-                ),
-                {"catch_id": catchment_id, "hand_id": self.hand_version_id},
-            )
-
-    def load_catchment_geometry(self, catchment_dir, transaction):
-        """Load and merge catchment geometries with error handling"""
-        print("  Loading catchment geometry...")
-        gpkg_files = self._get_files(catchment_dir, ".gpkg", "gw_catchments")
-
-        if not gpkg_files:
-            print("  No geometry files found")
-            return None
-
-        merged_geom = None
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for gpkg in gpkg_files:
-                try:
-                    local_path = self._download_if_s3(gpkg, tmpdir)
-                    gdf = gpd.read_file(local_path)
-                    if not gdf.empty:
-                        merged_geom = self._merge_geometries(merged_geom, gdf)
-                except Exception as e:
-                    print(f"  Error processing geometry file {gpkg}: {str(e)}")
-                    continue
-
-        if merged_geom is None:
-            return None
-
-        # Include hand_version_id and catchment geometry in UUID generation
-        unique_string = f"{self.hand_version_id}:{merged_geom.wkt}"
-        catchment_id = self._generate_uuid(unique_string)
-
-        transaction.execute(
-            text(
-                """
-                INSERT INTO Catchments (catchment_id, hand_version_id, geometry)
-                VALUES (:catch_id, :hand_id, ST_GeomFromText(:geom, 5070))
-                ON CONFLICT (catchment_id) DO NOTHING
-            """
-            ),
-            {
-                "catch_id": catchment_id,
-                "hand_id": self.hand_version_id,
-                "geom": merged_geom.wkt,
-            },
-        )
-        return catchment_id
-
-    def load_hydrotables(self, catchment_dir, catchment_id, transaction):
-        """Load hydrotable CSVs with proper version handling and error checking"""
-        print("  Loading hydrotables...")
-        csv_files = self._get_files(catchment_dir, ".csv", "hydroTable_")
-
-        if not csv_files:
-            print("  No hydrotable files found")
-            return
-
-        for csv_path in csv_files:
-            try:
-                df = self._read_csv(csv_path)
-                if df.empty:
-                    print(f"    CSV file {csv_path} is empty. Skipping.")
-                    continue
-
-                required_cols = [
-                    "HydroID",
-                    "feature_id",
-                    "HUC",
-                    "LakeID",
-                    "stage",
-                    "discharge_cms",
-                ]
-                missing_cols = [col for col in required_cols if col not in df.columns]
-                if missing_cols:
-                    print(
-                        f"    Skipping {csv_path} due to missing required columns: {', '.join(missing_cols)}"
-                    )
-                    continue
-
-                df["stage"] = pd.to_numeric(df["stage"], errors="coerce")
-                df["discharge_cms"] = pd.to_numeric(
-                    df["discharge_cms"], errors="coerce"
-                )
-
-                # feature_id is used for nwm_feature_id which is BIGINT
-                df["feature_id"] = pd.to_numeric(df["feature_id"], errors="coerce")
-
-                # Ensure grouping keys are treated as strings where appropriate before taking 'first'
-                df["HydroID"] = df["HydroID"].astype(str)
-                # For HUC and LakeID, they will be converted to string after 'first' aggregation
-                # For feature_id, it's numeric.
-
-                # --- MODIFICATION FOR NEW PK ---
-                # Group by HydroID. For other identifying columns (feature_id, HUC, LakeID),
-                # take the first non-null value. This assumes that within a CSV for a given HydroID,
-                # these other identifiers should ideally be consistent. If not, this strategy picks one.
-                def first_not_null(series):
-                    # Pandas 1.x: series.dropna().iloc[0] if not series.dropna().empty else None
-                    # Pandas 2.x: series.dropna().iat[0] if not series.dropna().empty else None
-                    # Using a more compatible way for older pandas if needed:
-                    valid_values = series.dropna()
-                    return valid_values.iloc[0] if not valid_values.empty else None
-
-                grouped = (
-                    df.groupby("HydroID")
-                    .agg(
-                        # For columns that become single values in the DB row
-                        nwm_feature_id_agg=("feature_id", first_not_null),
-                        huc_id_agg=("HUC", first_not_null),
-                        lake_id_agg=("LakeID", first_not_null),
-                        # For columns that become arrays
-                        stage_list=("stage", lambda x: sorted(list(x.dropna()))),
-                        discharge_cms_list=(
-                            "discharge_cms",
-                            lambda x: list(x.dropna()),
-                        ),
-                    )
-                    .reset_index()
-                )  # HydroID becomes a column again
-
-                # Ensure correct types for aggregated single-value columns before insertion
-                grouped["nwm_feature_id_agg"] = pd.to_numeric(
-                    grouped["nwm_feature_id_agg"], errors="coerce"
-                ).astype(
-                    "Int64"
-                )  # Allows <NA>
-                grouped["huc_id_agg"] = (
-                    grouped["huc_id_agg"]
-                    .astype(str)
-                    .replace("nan", pd.NA)
-                    .replace("None", pd.NA)
-                )
-                grouped["lake_id_agg"] = (
-                    grouped["lake_id_agg"]
-                    .astype(str)
-                    .replace("nan", pd.NA)
-                    .replace("None", pd.NA)
-                )
-                # --- END MODIFICATION ---
-
-                self._insert_aggregated_hydro_records(
-                    grouped, catchment_id, transaction
-                )
-
-            except Exception as e:
-                print(f"  Error processing hydrotable {csv_path}: {str(e)}")
-                raise
-
-    def _insert_aggregated_hydro_records(
-        self, aggregated_df, catchment_id, transaction
-    ):
-        """Insert aggregated hydrotable records."""
-        print(f"    Inserting {len(aggregated_df)} aggregated hydrotable records...")
-        for _, row in aggregated_df.iterrows():
-            if (
-                not row["stage_list"] and not row["discharge_cms_list"]
-            ):  # Allow if one is empty but not both, or adjust as needed
-                print(
-                    f"    Skipping record for HydroID {row['HydroID']} due to empty stage and discharge lists after aggregation."
-                )
-                continue
-
-            params = {
-                "catch_id": catchment_id,
-                "hand_id": self.hand_version_id,
-                "hydro_id": str(row["HydroID"]),
-                "nwm_ver": self.nwm_version_id,  # NWM version for the run
-                "feat_id": (
-                    row["nwm_feature_id_agg"]
-                    if pd.notna(row["nwm_feature_id_agg"])
-                    else None
-                ),
-                "huc_id_val": (
-                    str(row["huc_id_agg"]) if pd.notna(row["huc_id_agg"]) else None
-                ),
-                "lake_id_val": (
-                    str(row["lake_id_agg"]) if pd.notna(row["lake_id_agg"]) else None
-                ),
-                "stage_list": [float(s) for s in row["stage_list"]],
-                "discharge_list": [float(d) for d in row["discharge_cms_list"]],
-            }
-            try:
-                transaction.execute(
-                    text(
-                        """
-                        INSERT INTO Hydrotables (
-                            catchment_id, hand_version_id, HydroID, nwm_version_id,
-                                nwm_feature_id, stage, discharge_cms, huc_id, lake_id
-                        ) VALUES (
-                            :catch_id, :hand_id, :hydro_id, :nwm_ver, :feat_id,
-                                :stage_list, :discharge_list, :huc_id_val, :lake_id_val
-                        )
-                            ON CONFLICT (catchment_id, hand_version_id, HydroID) 
-                            DO UPDATE SET 
-                                nwm_version_id = EXCLUDED.nwm_version_id,
-                                nwm_feature_id = EXCLUDED.nwm_feature_id,
-                                stage = EXCLUDED.stage,
-                                discharge_cms = EXCLUDED.discharge_cms,
-                                huc_id = EXCLUDED.huc_id,
-                                lake_id = EXCLUDED.lake_id;
-                    """
-                    ),
-                    params,
-                )
-            except Exception as e:
-                print(
-                    f"    Error inserting aggregated hydro record for HydroID {row['HydroID']}: {str(e)}"
-                )
-                print(f"    Problematic params: {params}")
-                raise
-
-    def load_rasters(self, catchment_dir, catchment_id, transaction):
-        """Load all raster data types with error handling"""
-        print("  Loading REM rasters...")
-        rem_files = self._get_files(catchment_dir, ".tif", "rem_zeroed_")
-
-        if not rem_files:
-            print("  No REM raster files found")
-            return
-
-        print("  Loading catchment rasters...")
-        catchment_files = self._get_files(catchment_dir, ".tif", "gw_catchments")
-
-        try:
-            # First insert REM rasters and get their IDs
-            rem_raster_ids = self._insert_rem_rasters(
-                rem_files, catchment_id, transaction
-            )
-
-            # Then insert catchment rasters with their corresponding REM raster IDs
-            if catchment_files:
-                self._insert_catchment_rasters(
-                    catchment_files, rem_raster_ids, transaction
-                )
+# Build Pydantic models dynamically
+def build_models(schema: Dict) -> Dict[str, Type[BaseModel]]:
+    models = {}
+    for tbl, tbl_def in schema["tables"].items():
+        fields: Dict[str, Tuple[Any, Any]] = {}
+        for col, props in tbl_def["columns"].items():
+            col_type = props["type"]
+            if col_type not in TYPE_MAPPING:
+                raise ValueError(f"Unknown type '{col_type}' for {tbl}.{col}")
+            py_type, default = TYPE_MAPPING[col_type]
+            # force required if not nullable and no default
+            if not props.get("nullable", True) and default is None:
+                default = ...
+            extras = {}
+            if props.get("primary_key"):
+                extras["primary_key"] = True
+            if props.get("foreign_key"):
+                extras["foreign_key"] = props["foreign_key"]
+            if extras:
+                fields[col] = (py_type, Field(default, **extras))
             else:
-                print("  No catchment raster files found")
+                fields[col] = (py_type, default)
 
-        except Exception as e:
-            print(f"  Error processing rasters: {str(e)}")
-            raise
+        model = create_model(
+            tbl,
+            __base__=BaseModel,
+            __config__=ConfigDict(arbitrary_types_allowed=True),
+            **fields,
+        )
+        models[tbl] = model
+    return models
 
-    def _insert_rem_rasters(self, files, catchment_id, transaction):
-        """Insert REM rasters and return their IDs"""
-        rem_raster_ids = []
-        for file_path in files:
-            file_id = self._generate_uuid(file_path)
-            rem_raster_ids.append(file_id)
 
-            transaction.execute(
-                text(
-                    """
-                    INSERT INTO HAND_REM_Rasters
-                    (rem_raster_id, catchment_id, hand_version_id, raster_path)
-                    VALUES (:id, :catch_id, :version, :path)
-                """
+MODELS = build_models(SCHEMA)
+
+
+# Register PK values for FK checks
+def register_parent_keys(df: pd.DataFrame, tbl: str):
+    tbl_def = SCHEMA["tables"][tbl]
+    pk_cols = tbl_def.get("primary_key_columns") or [
+        c for c, p in tbl_def["columns"].items() if p.get("primary_key")
+    ]
+    if not pk_cols:
+        return
+
+    if len(pk_cols) == 1:
+        c = pk_cols[0]
+        vals = set(df[c].dropna().tolist())
+        if tbl_def["columns"][c]["type"] == "UUID":
+            vals = {to_uuid(v) for v in vals}
+        key = f"{tbl}.{c}"
+        PARENT_KEYS.setdefault(key, set()).update(vals)
+    else:
+        sub = df[pk_cols].dropna(how="any")
+        tup = {tuple(r) for r in sub.to_records(index=False)}
+        key = f"{tbl}.({','.join(pk_cols)})"
+        PARENT_KEYS.setdefault(key, set()).update(tup)
+
+
+# validator + writer
+def generic_validate_and_write(
+    records: List[Dict[str, Any]],
+    tbl: str,
+    outdir: Path,
+    is_geo: bool = False,
+    crs: Optional[str] = None,
+):
+    Model = MODELS[tbl]
+    valid, invalid = [], []
+    for idx, rec in enumerate(records):
+        # coerce DECIMAL/UUID/LIST_DECIMAL
+        for k, v in list(rec.items()):
+            col_def = SCHEMA["tables"][tbl]["columns"].get(k)
+            if not col_def:
+                continue
+            t = col_def["type"]
+            if t == "DECIMAL":
+                rec[k] = to_decimal(v)
+            elif t == "UUID":
+                rec[k] = to_uuid(v)
+            elif t == "LIST_DECIMAL" and v is not None:
+                rec[k] = [to_decimal(x) for x in v]
+        try:
+            inst = Model(**rec)
+            row = inst.model_dump(exclude_none=True)
+            if "geometry" in rec:
+                row["geometry"] = rec["geometry"]
+            valid.append(row)
+        except ValidationError as e:
+            invalid.append((idx, e.errors()))
+
+    if invalid:
+        print(f" {len(invalid)}/{len(records)} invalid rows in {tbl}")
+    if not valid:
+        print(f"→ skipping {tbl} (no valid rows)")
+        return
+
+    df = pd.DataFrame(valid)
+    if is_geo and "geometry" in df.columns:
+        gdf = gpd.GeoDataFrame(df, geometry="geometry", crs=crs or "EPSG:5070")
+        table = pa.Table.from_pandas(gdf, preserve_index=False)
+    else:
+        table = pa.Table.from_pandas(df, preserve_index=False)
+
+    existing = table.schema.metadata or {}
+    meta = {
+        b"custom_schema_name": SCHEMA["schema_name"].encode(),
+        b"custom_schema_version": SCHEMA["schema_version"].encode(),
+        b"custom_yaml_schema_src": Path(SCHEMA_PATH).name.encode(),
+    }
+    new_schema = table.schema.with_metadata({**existing, **meta})
+    # build the target URI (either "file:///…" or "s3://…")
+    fn = SCHEMA["tables"][tbl]["file_path"]
+    target = f"{outdir.rstrip('/')}/{fn}"
+    fs, path = fsspec.core.url_to_fs(target)
+    with fs.open(path, "wb") as f:
+        pq.write_table(table.cast(new_schema), f, compression="snappy")
+
+    fs, path = fsspec.core.url_to_fs(target)
+    # open an S3 (or local) file and write the parquet bytes
+    with fs.open(path, "wb") as f:
+        pq.write_table(table.cast(new_schema), f, compression="snappy")
+    print(f"wrote {len(valid)} rows → {tbl}")
+
+    register_parent_keys(gdf if is_geo and "geometry" in df.columns else df, tbl)
+
+
+# if path is S3, download to a temp dir
+TMP = tempfile.TemporaryDirectory()
+
+
+def fetch_local(path: str) -> str:
+    """If `path` starts with s3://, pull it down once into TMP and return local path."""
+    low = path.lower()
+    if low.startswith("s3://") or low.startswith("s3a://"):
+        fs, anon_path = fsspec.core.url_to_fs(path)
+        # internal path e.g. "bucket/key/to/file.gpkg"
+        name = Path(anon_path).name
+        local = Path(TMP.name) / name
+        if not local.exists():
+            with fs.open(anon_path, "rb") as src, open(local, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        return str(local)
+    else:
+        return path
+
+
+# Walk branch dirs in local or S3
+def list_branch_dirs(hand_dir: str) -> List[str]:
+    fs, root = fsspec.core.url_to_fs(hand_dir)
+    scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
+    branches: List[str] = []
+
+    # list all HUC8 directories under root
+    for info in fs.ls(root, detail=True):
+        if info["type"] != "directory":
+            continue
+        huc8 = info["name"]
+        br_root = f"{huc8}/branches"
+        # does branches/ exist?
+        if not fs.exists(br_root):
+            continue
+        # list each sub‐branch
+        for sub in fs.ls(br_root, detail=True):
+            if sub["type"] == "directory":
+                uri = f"{scheme}://{sub['name']}" if scheme != "file" else sub["name"]
+                branches.append(uri)
+    return branches
+
+
+# Load HAND suite from local or S3
+def load_hand_suite(
+    outdir: Path,
+    hand_dir: str,
+    hand_ver: str,
+    nwm_ver: Decimal,
+):
+    # find all branch folders
+    branch_dirs = list_branch_dirs(hand_dir)
+
+    # 1) Catchments
+    catch_recs: List[Dict[str, Any]] = []
+    dir_to_id: Dict[str, py_uuid.UUID] = {}
+    catch_crs = None
+
+    for d in branch_dirs:
+        print(f"processing branch: {d}")
+        # glob remote or local GPKG
+        fs, anon = fsspec.core.url_to_fs(d)
+        pl = fs.glob(f"{anon}/*gw_catchments*.gpkg")
+        if not pl:
+            continue
+
+        geoms = []
+        for anon_fp in pl:
+            scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
+            uri = f"{scheme}://{anon_fp}" if scheme != "file" else anon_fp
+            loc = fetch_local(uri)
+            gdf = gpd.read_file(loc)
+            if gdf.empty:
+                continue
+            catch_crs = catch_crs or gdf.crs
+            geoms.append(unary_union(gdf.geometry))
+
+        if not geoms:
+            continue
+        merged = unary_union(geoms)
+        cid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{hand_ver}:{merged.wkt}")
+        dir_to_id[d] = cid
+        catch_recs.append(
+            {
+                "catchment_id": cid,
+                "hand_version_id": hand_ver,
+                "geometry": merged,
+                "additional_attributes": None,
+            }
+        )
+
+    generic_validate_and_write(
+        catch_recs, "Catchments", outdir, is_geo=True, crs=catch_crs or "EPSG:5070"
+    )
+
+    valid_cids = PARENT_KEYS.get("Catchments.catchment_id", set())
+    branch_dirs = [d for d in branch_dirs if dir_to_id.get(d) in valid_cids]
+
+    # 2) Hydrotables
+    hydro_recs: List[Dict[str, Any]] = []
+    for d in branch_dirs:
+        fs, anon = fsspec.core.url_to_fs(d)
+        csvs = fs.glob(f"{anon}/hydroTable_*.csv")
+        if not csvs:
+            continue
+
+        # load each CSV into a single DF
+        pieces = []
+        for anon_fp in csvs:
+            scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
+            uri = f"{scheme}://{anon_fp}" if scheme != "file" else anon_fp
+            loc = fetch_local(uri)
+            pieces.append(pd.read_csv(loc))
+        df = pd.concat(pieces, ignore_index=True)
+
+        # coerce
+        df["stage"] = pd.to_numeric(df["stage"], errors="coerce")
+        df["discharge_cms"] = pd.to_numeric(df["discharge_cms"], errors="coerce")
+        df["feature_id"] = pd.to_numeric(df["feature_id"], errors="coerce")
+        df["HydroID"] = df["HydroID"].astype(str)
+
+        def first_notnull(s):
+            return s.dropna().iloc[0] if not s.dropna().empty else None
+
+        grp = (
+            df.groupby("HydroID")
+            .agg(
+                nwm_feature_id_agg=("feature_id", first_notnull),
+                huc_id_agg=("HUC", first_notnull),
+                lake_id_agg=("LakeID", first_notnull),
+                stage_list=(
+                    "stage",
+                    lambda v: [to_decimal(x) for x in sorted(v.dropna())],
                 ),
-                {
-                    "id": file_id,
-                    "catch_id": catchment_id,
-                    "version": self.hand_version_id,
-                    "path": file_path,
-                },
+                discharge_list=(
+                    "discharge_cms",
+                    lambda v: [to_decimal(x) for x in v.dropna()],
+                ),
             )
-        return rem_raster_ids
+            .reset_index()
+        )
 
-    def _insert_catchment_rasters(self, files, rem_raster_ids, transaction):
-        """Insert catchment rasters linking them to REM rasters"""
-        for file_path in files:
-            # Generate a unique ID for the catchment raster
-            catchment_raster_id = self._generate_uuid(file_path)
-
-            # For each catchment raster, we need to link it to a REM raster
-            # Here we're assuming a 1:1 relationship and using the first REM raster ID
-            # Modify this logic if there's a specific mapping between REM and catchment rasters
-            if rem_raster_ids:
-                transaction.execute(
-                    text(
-                        """
-                        INSERT INTO HAND_Catchment_Rasters
-                        (catchment_raster_id, rem_raster_id, raster_path)
-                        VALUES (:id, :rem_id, :path)
-                    """
+        for _, r in grp.iterrows():
+            hydro_recs.append(
+                {
+                    "catchment_id": dir_to_id[d],
+                    "hand_version_id": hand_ver,
+                    "HydroID": r["HydroID"],
+                    "nwm_feature_id": (
+                        int(r["nwm_feature_id_agg"])
+                        if pd.notna(r["nwm_feature_id_agg"])
+                        else None
                     ),
-                    {
-                        "id": catchment_raster_id,
-                        "rem_id": rem_raster_ids[0],  # Using first REM raster ID
-                        "path": file_path,
-                    },
-                )
+                    "nwm_version_id": (
+                        nwm_ver if pd.notna(r["nwm_feature_id_agg"]) else None
+                    ),
+                    "stage": r["stage_list"],
+                    "discharge_cms": r["discharge_list"],
+                    "huc_id": (
+                        str(r["huc_id_agg"]) if pd.notna(r["huc_id_agg"]) else None
+                    ),
+                    "lake_id": (
+                        str(r["lake_id_agg"]) if pd.notna(r["lake_id_agg"]) else None
+                    ),
+                }
+            )
 
-    def load_nwm_lakes(self, gpkg_path):
-        """Load NWM lakes from GeoPackage (local or S3)."""
-        print("Loading NWM lakes...")
-        with self.temp_load_gpkg(gpkg_path) as gdf:
-            with self.engine.begin() as conn:
-                for _, row in gdf.iterrows():
-                    conn.execute(
-                        text(
-                            """
-                            INSERT INTO NWM_Lakes (nwm_lake_id, geometry, shape_area)
-                            VALUES (:id, ST_GeomFromText(:geom, 5070), :area)
-                        """
-                        ),
-                        {
-                            "id": row["newID"],
-                            "geom": row["geometry"].wkt,
-                            "area": row["Shape_Area"],
-                        },
-                    )
+    generic_validate_and_write(hydro_recs, "Hydrotables", outdir)
 
-    def load_hucs(self, gpkg_path):
-        """Load HUCs from GeoPackage."""
-        print("Loading HUCs...")
-        with self.temp_load_gpkg(gpkg_path) as gdf:
-            for layer_info in [
-                ("WBDHU2", 2),
-                ("WBDHU4", 4),
-                ("WBDHU6", 6),
-                ("WBDHU8", 8),
-            ]:
-                if layer_info[0] in gdf:
-                    layer = layer_info[0]
-                    level = layer_info[1]
-                    print(f"  Processing HUC{level}...")
-                    huc_gdf = gdf[layer_info[0]]
-                    with self.engine.begin() as conn:
-                        for _, row in huc_gdf.iterrows():
-                            conn.execute(
-                                text(
-                                    """
-                                    INSERT INTO HUCS (huc_id, level, geometry, area_sq_km, states)
-                                    VALUES (:huc_id, :level, ST_GeomFromText(:geom, 5070), :area, :states)
-                                """
-                                ),
-                                {
-                                    "huc_id": row[f"HUC{level}"],
-                                    "level": level,
-                                    "geom": row["geometry"].wkt,
-                                    "area": row["areasqkm"],
-                                    "states": row["states"],
-                                },
-                            )
+    # 3) HAND_REM_Rasters
+    rem_recs: List[Dict[str, Any]] = []
+    rem_map: Dict[str, List[py_uuid.UUID]] = {}
 
-    def load_levees(self, gpkg_path):
-        """Load levees from GeoPackage."""
-        print("Loading levees...")
-        with self.temp_load_gpkg(gpkg_path) as gdf:
-            with self.engine.begin() as conn:
-                for _, row in gdf.iterrows():
-                    conn.execute(
-                        text(
-                            """
-                            INSERT INTO Levees (levee_id, geometry, name, systemID, 
-                                              systemName, areaSquareMiles, leveedAreaSource)
-                            VALUES (:id, ST_GeomFromText(:geom, 5070), :name, 
-                                   :sys_id, :sys_name, :area, :source)
-                        """
-                        ),
-                        {
-                            "id": row["id"],
-                            "geom": row["geometry"].wkt,
-                            "name": row["name"],
-                            "sys_id": row["systemId"],
-                            "sys_name": row["systemName"],
-                            "area": row["areaSquareMiles"],
-                            "source": row["leveedAreaSource"],
-                        },
-                    )
+    for d in branch_dirs:
+        fs, anon = fsspec.core.url_to_fs(d)
+        tifs = fs.glob(f"{anon}/*rem_zeroed*.tif")
+        if not tifs:
+            continue
 
-    def load_nwm_features(self, gpkg_path):
-        """Load NWM features from GeoPackage file."""
-        print("Loading NWM features...")
-        with self.temp_load_gpkg(gpkg_path) as gdf:
-            gdf = gdf["nwm_streams"]
-            dropped_count = 0
-            with self.engine.begin() as conn:
-                for _, row in gdf.iterrows():
-                    result = conn.execute(
-                        text(
-                            """
-                            INSERT INTO NWM_Features (nwm_feature_id, nwm_version_id, geometry,
-                                                    to_feature, stream_order, lake, gages, slope, mainstem)
-                            VALUES (:feat_id, :ver_id, ST_GeomFromText(:geom, 5070),
-                                    :to_feature, :order, :lake, :gages, :slope, :mainstem)
-                            ON CONFLICT (nwm_feature_id, nwm_version_id) DO NOTHING
-                        """
-                        ),
-                        {
-                            "feat_id": row["ID"],
-                            "ver_id": self.nwm_version_id,
-                            "geom": row["geometry"].wkt,
-                            "to_feature": row["to"],
-                            "order": row["order_"],
-                            "lake": row["Lake"],
-                            "gages": row["gages"],
-                            "slope": row["Slope"],
-                            "mainstem": row["mainstem"],
-                        },
-                    )
-                    if result.rowcount == 0:
-                        dropped_count += 1
-            print(f"Dropped {dropped_count} duplicate NWM features")
+        ids: List[py_uuid.UUID] = []
+        for anon_fp in tifs:
+            scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
+            uri = f"{scheme}://{anon_fp}" if scheme != "file" else anon_fp
+            rid = py_uuid.uuid5(
+                py_uuid.NAMESPACE_DNS, f"{dir_to_id[d]}:{Path(uri).name}"
+            )
+            ids.append(rid)
+            rem_recs.append(
+                {
+                    "rem_raster_id": rid,
+                    "catchment_id": dir_to_id[d],
+                    "hand_version_id": hand_ver,
+                    "raster_path": uri,
+                    "metadata": None,
+                }
+            )
+        rem_map[d] = ids
 
-    def _generate_uuid(self, input_str):
-        """Generate a UUID from an input string."""
-        return str(uuid.uuid5(uuid.NAMESPACE_DNS, input_str))
+    generic_validate_and_write(rem_recs, "HAND_REM_Rasters", outdir)
 
-    def temp_load_gpkg(self, gpkg_uri, layers=None):
-        """Context manager for loading GeoPackages from S3 or local."""
-        if self.is_s3_path(gpkg_uri):
-            with tempfile.NamedTemporaryFile(suffix=".gpkg") as tmpfile:
-                self.download_s3_file(gpkg_uri, tmpfile.name)
-                return gpd.read_file(tmpfile.name, layer=layers)
-        else:
-            return gpd.read_file(gpkg_uri, layer=layers)
+    # 4) HAND_Catchment_Rasters
+    cr_recs: List[Dict[str, Any]] = []
+    for d, ids in rem_map.items():
+        first_rem = ids[0]
+        for anon_fp in fsspec.core.url_to_fs(d)[0].glob(
+            f"{fsspec.core.url_to_fs(d)[1]}/*gw_catchments*.tif"
+        ):
+            uri = f"{fsspec.core.url_to_fs(d)[0].protocol}://{anon_fp}"
+            cid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{first_rem}:{Path(uri).name}")
+            cr_recs.append(
+                {
+                    "catchment_raster_id": cid,
+                    "rem_raster_id": first_rem,
+                    "raster_path": uri,
+                    "metadata": None,
+                }
+            )
+
+    generic_validate_and_write(cr_recs, "HAND_Catchment_Rasters", outdir)
 
 
 def main():
-    """Main function with updated CLI arguments."""
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Load HAND data into database")
-    parser.add_argument(
-        "--db-connection", required=True, help="Database connection string"
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "--output-dir",
+        required=True,
+        help="where to write your Parquet/Geoparquet files",
     )
-    parser.add_argument(
-        "--general-dir", help="General data directory/path (S3 or local)"
+    p.add_argument(
+        "--hand-dir",
+        required=True,
+        help="root of your HAND HUC8 tree (local path or s3://…)",
     )
-    parser.add_argument("--hand-dir", help="HAND data directory/path (S3 or local)")
-    parser.add_argument(
-        "--hand-version", required=True, help="HAND version ID (e.g., v3.0)"
-    )
-    parser.add_argument(
-        "--nwm-version", type=float, required=True, help="NWM version (e.g., 3.0)"
-    )
+    p.add_argument("--hand-version", required=True, help="a text id for this HAND run")
+    p.add_argument("--nwm-version", required=True, help="NWM version (decimal)")
+    args = p.parse_args()
 
-    args = parser.parse_args()
-    loader = DatabaseLoader(args.db_connection, args.hand_version, args.nwm_version)
+    outdir_uri = args.output_dir.rstrip("/")
+    # if this is a true URI (s3:// or s3a://) we do NOT mkdir() locally
+    if outdir_uri.startswith(("s3://", "s3a://")):
+        outdir = outdir_uri
+    else:
+        outdir = Path(outdir_uri)
+        outdir.mkdir(parents=True, exist_ok=True)
+        outdir = str(outdir)
 
-    if args.general_dir:
-        loader.load_general_data(args.general_dir)
+    hand_ver = args.hand_version
+    nwm_ver = Decimal(args.nwm_version)
 
-    if args.hand_dir:
-        loader.load_hand_data(args.hand_dir)
+    # enforce that the hand-version string appears somewhere in the output path
+    if hand_ver not in str(outdir):
+        p.error(f"--output-dir ('{outdir}') must contain the hand-version '{hand_ver}'")
+
+    load_hand_suite(outdir, args.hand_dir, hand_ver, nwm_ver)
+
+    print("\nDONE. Parent Key registry summary:")
+    for k, v in PARENT_KEYS.items():
+        print(f"  {k}: {len(v)} keys")
 
 
 if __name__ == "__main__":

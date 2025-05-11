@@ -1,0 +1,50 @@
+schema_name: "hand-index"
+schema_version: "v0.1" 
+
+tables:
+
+  Catchments:
+    file_path: "catchments.geoparquet"
+    pydantic_model: "Catchment"
+    columns:
+      catchment_id: {type: "UUID", primary_key: true, nullable: false}
+      hand_version_id: {type: "TEXT", nullable: false}
+      geometry: {type: "GEOMETRY", nullable: true, geometry_type_constraint: "ST_MultiPolygon, ST_Polygon"}
+      additional_attributes: {type: "JSONB", nullable: true}
+
+  Hydrotables:
+    file_path: "hydrotables.parquet"
+    pydantic_model: "Hydrotable"
+    primary_key_columns: ["catchment_id", "hand_version_id", "HydroID"]
+    columns:
+      catchment_id: {type: "UUID", nullable: false, foreign_key: "Catchments.catchment_id"}
+      hand_version_id: {type: "TEXT", nullable: false} 
+      HydroID: {type: "TEXT", nullable: false}
+      nwm_version_id: {type: "DECIMAL", nullable: true} # Part of FK to NWM_Features
+      nwm_feature_id: {type: "BIGINT", nullable: true}   # Part of FK to NWM_Features
+      # Composite FK: (nwm_feature_id, nwm_version_id) refers to NWM_Features.(nwm_feature_id, nwm_version_id)
+      # This will be handled by a root_validator in Pydantic or special logic
+      stage: {type: "LIST_DECIMAL", nullable: true}
+      discharge_cms: {type: "LIST_DECIMAL", nullable: true}
+      huc_id: {type: "TEXT", nullable: true, foreign_key: "HUCS.huc_id"}
+      lake_id: {type: "TEXT", nullable: true} # Could be an FK to NWM_Lakes.nwm_lake_id if it's always numeric ID, or just text
+
+  HAND_REM_Rasters:
+    file_path: "hand_rem_rasters.parquet"
+    pydantic_model: "HANDREMRaster"
+    columns:
+      rem_raster_id: {type: "UUID", primary_key: true, nullable: false}
+      catchment_id: {type: "UUID", nullable: false, foreign_key: "Catchments.catchment_id"}
+      hand_version_id: {type: "TEXT", nullable: false}
+      raster_path: {type: "TEXT", nullable: true}
+      metadata: {type: "JSONB", nullable: true}
+
+  HAND_Catchment_Rasters:
+    file_path: "hand_catchment_rasters.parquet"
+    pydantic_model: "HANDCatchmentRaster"
+    columns:
+      catchment_raster_id: {type: "UUID", primary_key: true, nullable: false}
+      rem_raster_id: {type: "UUID", nullable: false, foreign_key: "HAND_REM_Rasters.rem_raster_id"}
+      raster_path: {type: "TEXT", nullable: true}
+      metadata: {type: "JSONB", nullable: true}
+
