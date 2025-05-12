@@ -343,16 +343,14 @@ def process_branch(args: Tuple[str, str, str]) -> Tuple[
             def first_notnull(s):
                 return s.dropna().iloc[0] if not s.dropna().empty else None
 
+            df = df.sort_values(["HydroID", "stage"])
             grp = (
                 df.groupby("HydroID")
                 .agg(
                     nwm_feature_id_agg=("feature_id", first_notnull),
                     huc_id_agg=("HUC", first_notnull),
                     lake_id_agg=("LakeID", first_notnull),
-                    stage_list=(
-                        "stage",
-                        lambda v: [to_decimal(x) for x in sorted(v.dropna())],
-                    ),
+                    stage_list=("stage", lambda v: [to_decimal(x) for x in v.dropna()]),
                     discharge_list=(
                         "discharge_cms",
                         lambda v: [to_decimal(x) for x in v.dropna()],
