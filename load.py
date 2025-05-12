@@ -304,6 +304,7 @@ def process_branch(args: Tuple[str, str, str]) -> Tuple[
     if geoms:
         merged = unary_union(geoms)
         parts = uri.split(f"{hand_ver}/", 1)
+        # relative uri for everything after hand version makes it so that uuid's for a hand run should be the same whether on local or s3
         rel_uri = f"{hand_ver}/{parts[1]}" if len(parts) == 2 else uri
         cid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{Path(rel_uri)}:{merged.wkt}")
         catch_rec = {
@@ -491,43 +492,55 @@ def load_hand_suite(
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument(
-        "--output-dir",
-        required=True,
-        help="where to write your Parquet/Geoparquet files",
-    )
-    p.add_argument(
-        "--hand-dir",
-        required=True,
-        help="root of your HAND HUC8 tree (local path or s3://…)",
-    )
-    p.add_argument("--hand-version", required=True, help="a text id for this HAND run")
-    p.add_argument("--nwm-version", required=True, help="NWM version (decimal)")
-    args = p.parse_args()
-
-    outdir_uri = args.output_dir.rstrip("/")
-    if outdir_uri.startswith(("s3://", "s3a://")):
-        outdir = outdir_uri
-    else:
-        Path(outdir_uri).mkdir(parents=True, exist_ok=True)
-        outdir = outdir_uri
-
-    hand_ver = args.hand_version
-    nwm_ver = Decimal(args.nwm_version)
-
-    if hand_ver not in str(outdir):
-        p.error(
-            f"--hand-dir ('{args.hand_dir}') must contain the hand-version '{hand_ver}'"
+    try:
+        p = argparse.ArgumentParser()
+        p.add_argument(
+            "--output-dir",
+            required=True,
+            help="where to write your Parquet/Geoparquet files",
         )
-    if hand_ver not in str(outdir):
-        p.error(f"--output-dir ('{outdir}') must contain the hand-version '{hand_ver}'")
+        p.add_argument(
+            "--hand-dir",
+            required=True,
+            help="root of your HAND HUC8 tree (local path or s3://…)",
+        )
+        p.add_argument(
+            "--hand-version", required=True, help="a text id for this HAND run"
+        )
+        p.add_argument("--nwm-version", required=True, help="NWM version (decimal)")
+        args = p.parse_args()
 
-    load_hand_suite(outdir, args.hand_dir, hand_ver, nwm_ver)
+        outdir_uri = args.output_dir.rstrip("/")
+        if outdir_uri.startswith(("s3://", "s3a://")):
+            outdir = outdir_uri
+        else:
+            Path(outdir_uri).mkdir(parents=True, exist_ok=True)
+            outdir = outdir_uri
 
-    print("\nDONE. Parent Key registry summary:")
-    for k, v in PARENT_KEYS.items():
-        print(f"  {k}: {len(v)} keys")
+        hand_ver = args.hand_version
+        nwm_ver = Decimal(args.nwm_version)
+
+        if hand_ver not in str(outdir):
+            p.error(
+                f"--hand-dir ('{args.hand_dir}') must contain the hand-version '{hand_ver}'"
+            )
+        if hand_ver not in str(outdir):
+            p.error(
+                f"--output-dir ('{outdir}') must contain the hand-version '{hand_ver}'"
+            )
+
+        load_hand_suite(outdir, args.hand_dir, hand_ver, nwm_ver)
+
+        print("\nDONE. Parent Key registry summary:")
+        for k, v in PARENT_KEYS.items():
+            print(f"  {k}: {len(v)} keys")
+    finally:
+        if TMP:  # Check if TMP was successfully created
+            print(f"Cleaning up temporary directory: {TMP.name}")
+            try:
+                TMP.cleanup()
+            except Exception as e:
+                print(f"Error cleaning up temporary directory {TMP.name}: {e}")
 
 
 if __name__ == "__main__":
