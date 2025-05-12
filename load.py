@@ -300,6 +300,7 @@ def process_branch(args: Tuple[str, str, str]) -> Tuple[
             continue
         catch_crs = catch_crs or gdf.crs.to_string()
         geoms.append(unary_union(gdf.geometry))
+        os.remove(loc)
 
     if geoms:
         merged = unary_union(geoms)
@@ -333,6 +334,8 @@ def process_branch(args: Tuple[str, str, str]) -> Tuple[
                 print(f"  couldn't read CSV: {uri} because of {e}")
                 continue
             pieces.append(pd.read_csv(loc))
+            # cleanup downloaded hydrotable
+            os.remove(loc)
         if pieces:
             df = pd.concat(pieces, ignore_index=True)
             df["stage"] = pd.to_numeric(df["stage"], errors="coerce")
@@ -384,7 +387,6 @@ def process_branch(args: Tuple[str, str, str]) -> Tuple[
                         ),
                     }
                 )
-
     # REM Raster
     rem_ids: List[py_uuid.UUID] = []
     rem_tifs = fs.glob(f"{anon}/*rem_zeroed*.tif")
