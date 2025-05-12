@@ -303,7 +303,9 @@ def process_branch(args: Tuple[str, str, str]) -> Tuple[
 
     if geoms:
         merged = unary_union(geoms)
-        cid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{Path(uri)}:{merged.wkt}")
+        parts = uri.split(f"{hand_ver}/", 1)
+        rel_uri = f"{hand_ver}/{parts[1]}" if len(parts) == 2 else uri
+        cid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{Path(rel_uri)}:{merged.wkt}")
         catch_rec = {
             "catchment_id": cid,
             "hand_version_id": hand_ver,
@@ -401,7 +403,9 @@ def process_branch(args: Tuple[str, str, str]) -> Tuple[
         rem_tif = rem_tifs[0]
         scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
         uri = f"{scheme}://{rem_tif}" if scheme != "file" else rem_tif
-        rid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{cid}:{Path(uri)}")
+        parts = uri.split(f"{hand_ver}/", 1)
+        rel_uri = f"{hand_ver}/{parts[1]}" if len(parts) == 2 else uri
+        rid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{cid}:{Path(rel_uri)}")
         rem_ids.append(rid)
         rem_recs.append(
             {
@@ -429,7 +433,9 @@ def process_branch(args: Tuple[str, str, str]) -> Tuple[
         catch_tif = catch_tifs[0]
         scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
         uri = f"{scheme}://{catch_tif}" if scheme != "file" else catch_tif
-        crid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{rem_ids[0]}:{Path(uri)}")
+        parts = uri.split(f"{hand_ver}/", 1)
+        rel_uri = f"{hand_ver}/{parts[1]}" if len(parts) == 2 else uri
+        crid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{rem_ids[0]}:{Path(rel_uri)}")
         cr_recs.append(
             {
                 "catchment_raster_id": crid,
