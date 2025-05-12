@@ -1,161 +1,229 @@
-import duckdb
+#!/usr/bin/env python3
+"""
+Fetch catchment data from DuckDB, filter by spatial overlap, 
+and write per-catchment attribute tables to separate Parquet files.
+"""
+
 import os
+import argparse
+import logging
+from pathlib import Path
+from typing import Tuple, Optional, Dict
+
+import duckdb
 import geopandas as gpd
-from shapely.geometry import shape
-from shapely.wkt import dumps  # To convert shapely geometry to WKT
-import json
+import pandas as pd
+from shapely.wkt import dumps
+from shapely.geometry import Polygon
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 
-def get_catchment_data_for_geojson_poly(
-    geojson_filepath: str, duckdb_con
-) -> gpd.GeoDataFrame:
+def _common_cte(wkt4326: str) -> str:
     """
-    Reads a polygon from a GeoJSON file, queries DuckDB for intersecting catchments
-    and their associated data, and returns the result as a GeoDataFrame.
-
-    Args:
-        geojson_filepath (str): Path to the GeoJSON file containing the query polygon.
-        duckdb_con: An active DuckDB connection object.
-
-    Returns:
-        gpd.GeoDataFrame: A GeoDataFrame with the query results, CRS set to EPSG:5070.
-                           Returns an empty GeoDataFrame if no results or error.
+    Returns the shared CTE for transforming the WKT and filtering catchments.
     """
-    try:
-        # 1. Read GeoJSON and convert the polygon to WKT
-        # Using geopandas.read_file is robust for various GeoJSON structures
-        gdf_query_poly_4326 = gpd.read_file(geojson_filepath)
+    return f"""
+    WITH input_query AS (
+      SELECT '{wkt4326}' AS wkt_string
+    ),
+    transformed_query AS (
+      SELECT
+        ST_Transform(
+          ST_GeomFromText(wkt_string),
+          'EPSG:4326', 'EPSG:5070', TRUE
+        ) AS query_geom
+      FROM input_query
+    ),
+    filtered_catchments AS (
+      SELECT DISTINCT
+        c.catchment_id,
+        c.geometry
+      FROM catchments AS c
+      JOIN transformed_query AS tq
+        ON ST_Intersects(c.geometry, tq.query_geom)
+    )
+    """
 
-        if gdf_query_poly_4326.empty:
-            print("GeoJSON file is empty or could not be read as a GeoDataFrame.")
-            return gpd.GeoDataFrame()
 
-        # Assuming we use the first geometry from the GeoJSON
-        # Ensure it's projected to EPSG:4326 if it has a different CRS
-        if gdf_query_poly_4326.crs and gdf_query_poly_4326.crs.to_epsg() != 4326:
-            print(
-                f"Query polygon CRS is {gdf_query_poly_4326.crs}. Re-projecting to EPSG:4326."
-            )
-            gdf_query_poly_4326 = gdf_query_poly_4326.to_crs(epsg=4326)
-        elif not gdf_query_poly_4326.crs:
-            print("Query polygon has no CRS defined. Assuming EPSG:4326.")
-            # If no CRS, GeoPandas might not set it. We proceed assuming it's 4326 for WKT.
+def get_catchment_data_for_geojson_poly_split(
+    geojson_fp: str, con: duckdb.DuckDBPyConnection
+) -> Tuple[gpd.GeoDataFrame, pd.DataFrame, Optional[Polygon]]:
+    """
+    Reads a GeoJSON polygon, runs two spatial queries against DuckDB
+    (one for geometries, one for attributes), and returns:
 
-        query_shapely_geom_4326 = gdf_query_poly_4326.geometry.iloc[0]
-        wkt_polygon_epsg4326 = dumps(query_shapely_geom_4326)
+      - geometries_gdf: GeoDataFrame[c   atchment_id, geometry in EPSG:5070]
+      - attributes_df: DataFrame[*all attribute columns* including catchment_id]
+      - query_polygon_5070: shapely Polygon for later overlap filtering
+    """
+    # 1) Load & reproject the query polygon
+    gdf = gpd.read_file(geojson_fp)
+    if gdf.empty:
+        logger.error("GeoJSON is empty or invalid: %s", geojson_fp)
+        return gpd.GeoDataFrame(), pd.DataFrame(), None
 
-        # 2. Construct the SQL query with a placeholder for WKT
-        # We output the catchment geometry as WKB for easy conversion in GeoPandas
-        sql_query = """
-        LOAD spatial;
-        WITH input_query_polygon_wkt AS (
-            SELECT ? AS wkt_string -- Placeholder for the WKT string
-        ),
-        transformed_query_geometry AS (
-            SELECT
-                ST_Transform(
-                    ST_GeomFromText(iqpw.wkt_string), -- DuckDB infers WKT, SRID will be set by ST_Transform
-                    'EPSG:4326',  -- Source SRID
-                    'EPSG:5070',  -- Target SRID
-                    true          -- always_xy: Assume input (4326) is Lon/Lat and output (5070) is Easting/Northing
-                ) AS query_geom_epsg5070
-            FROM
-                input_query_polygon_wkt iqpw
-        ),
-        filtered_catchments AS (
-            SELECT DISTINCT
-                c.catchment_id,
-                ST_AsWKB(c.geometry) AS geometry_wkb -- Output geometry as WKB
-            FROM
-                catchments c, transformed_query_geometry tqg
-            WHERE
-                ST_Intersects(c.geometry, tqg.query_geom_epsg5070)
+    # Ensure CRS is EPSG:4326 for injection into SQL
+    if gdf.crs is None:
+        logger.info("Assuming input GeoJSON CRS = EPSG:4326")
+        gdf.set_crs(epsg=4326, inplace=True)
+    elif gdf.crs.to_epsg() != 4326:
+        logger.info("Reprojecting query polygon to EPSG:4326")
+        gdf = gdf.to_crs(epsg=4326)
+
+    src_poly_4326 = gdf.geometry.iloc[0]
+    wkt4326 = dumps(src_poly_4326)
+
+    # Also get the same polygon in EPSG:5070 for Python overlap checks
+    query_poly_5070 = gdf.to_crs(epsg=5070).geometry.iloc[0]
+
+    # 2) Build and run the geometry-only query
+    cte = _common_cte(wkt4326)
+    sql_geom = (
+        cte
+        + """
+    SELECT
+      fc.catchment_id,
+      ST_AsWKB(fc.geometry) AS geom_wkb
+    FROM filtered_catchments AS fc;
+    """
+    )
+    geom_df = con.execute(sql_geom).fetch_df()
+    if geom_df.empty:
+        logger.info("No catchments intersect the query polygon.")
+        empty_gdf = gpd.GeoDataFrame(
+            columns=["catchment_id", "geometry"], geometry="geometry", crs="EPSG:5070"
         )
-        SELECT
-            fc.catchment_id,
-            fc.geometry_wkb, -- This will be our geometry column
-            ht.* EXCLUDE (catchment_id),
-            hrr.raster_path as rem_raster_path,
-            hcr.raster_path AS catchment_raster_path
-        FROM
-            filtered_catchments fc
-        LEFT JOIN
-            hydrotables ht ON fc.catchment_id = ht.catchment_id
-        LEFT JOIN
-            hand_rem_rasters hrr ON fc.catchment_id = hrr.catchment_id
-        LEFT JOIN
-            hand_catchment_rasters hcr ON hrr.rem_raster_id = hcr.rem_raster_id
-        LIMIT 1;
-        """
+        return empty_gdf, pd.DataFrame(), query_poly_5070
 
-        # 3. Execute the query
-        print(
-            f"Querying with WKT: {wkt_polygon_epsg4326[:100]}..."
-        )  # Print start of WKT for sanity check
-        result_df = duckdb_con.execute(sql_query, [wkt_polygon_epsg4326]).fetch_df()
+    # Decode WKB → shapely geometries
+    wkb_series = geom_df["geom_wkb"].apply(
+        lambda x: bytes(x) if isinstance(x, bytearray) else x
+    )
+    geometries_gdf = gpd.GeoDataFrame(
+        geom_df[["catchment_id"]],
+        geometry=gpd.GeoSeries.from_wkb(wkb_series, crs="EPSG:5070"),
+        crs="EPSG:5070",
+    )
 
-        if result_df.empty:
-            print("No catchments found intersecting the provided polygon.")
-            return gpd.GeoDataFrame()
+    # 3) Build and run the attribute query
+    sql_attr = (
+        cte
+        + """
+    SELECT
+      f.catchment_id,
+      ht.* EXCLUDE (catchment_id),
+      hrr.raster_path   AS rem_raster_path,
+      hcr.raster_path   AS catchment_raster_path
+    FROM filtered_catchments AS f
+    LEFT JOIN hydrotables             AS ht   ON f.catchment_id = ht.catchment_id
+    LEFT JOIN hand_rem_rasters       AS hrr  ON f.catchment_id = hrr.catchment_id
+    LEFT JOIN hand_catchment_rasters AS hcr  ON hrr.rem_raster_id = hcr.rem_raster_id;
+    """
+    )
+    attributes_df = con.execute(sql_attr).fetch_df()
 
-        # 4. Convert the Pandas DataFrame to a GeoPandas GeoDataFrame
-        # The 'geometry_wkb' column contains WKB (Well-Known Binary)
-        wkb_series = result_df["geometry_wkb"].apply(
-            lambda x: bytes(x) if isinstance(x, bytearray) else x
-        )
-        geometries = gpd.GeoSeries.from_wkb(wkb_series)
-        gdf_results = gpd.GeoDataFrame(result_df, geometry=geometries, crs="EPSG:5070")
-
-        # Optional: drop the WKB column if you only want the geometry object column
-        gdf_results = gdf_results.drop(columns=["geometry_wkb"])
-
-        return gdf_results
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        return gpd.GeoDataFrame()  # Return an empty GeoDataFrame on error
+    return geometries_gdf, attributes_df, query_poly_5070
 
 
-# --- Example Usage ---
-if __name__ == "__main__":
-    # Create a dummy GeoJSON file for testing
-    geojson_content = {
-        "type": "FeatureCollection",
-        "features": [
-            {
-                "type": "Feature",
-                "properties": {},
-                "geometry": {
-                    "type": "Polygon",
-                    "coordinates": [
-                        [
-                            [-85.605165, 30.357851],  # lon_min, lat_min
-                            [-80.839729, 30.357851],  # lon_max, lat_min
-                            [-80.839729, 35.000659],  # lon_max, lat_max
-                            [-85.605165, 35.000659],  # lon_min, lat_max
-                            [-85.605165, 30.357851],  # lon_min, lat_min (closed)
-                        ]
-                    ],
-                },
-            }
-        ],
+def filter_dataframes_by_overlap(
+    geometries_gdf: gpd.GeoDataFrame,
+    attributes_df: pd.DataFrame,
+    query_polygon_5070: Polygon,
+    overlap_threshold_percent: float = 10.0,
+) -> Tuple[gpd.GeoDataFrame, pd.DataFrame, Dict[str, int]]:
+    """
+    Filters geometries and attributes by the % overlap with query_polygon_5070.
+    Returns (filtered_geoms, filtered_attrs, summary_stats).
+    """
+    stats = {
+        "initial_geoms": len(geometries_gdf),
+        "initial_attrs": len(attributes_df),
     }
-    dummy_geojson_path = "test_data/georgia_query_polygon.geojson"
-    with open(dummy_geojson_path, "w") as f:
-        json.dump(geojson_content, f)
+    if geometries_gdf.empty or query_polygon_5070 is None:
+        stats.update(final_geoms=0, final_attrs=0, removed_geoms=0, removed_attrs=0)
+        return geometries_gdf.copy(), attributes_df.copy(), stats
 
-    con = duckdb.connect(database="test_data/test-hand-index.ddb", read_only=True)
+    geoms = geometries_gdf.copy()
+    geoms["area"] = geoms.geometry.area
+    geoms["inter"] = geoms.geometry.apply(
+        lambda g: g.intersection(query_polygon_5070).area if not g.is_empty else 0.0
+    )
+    geoms["pct"] = (geoms["inter"] / geoms["area"].replace({0: pd.NA})) * 100
+    geoms["pct"].fillna(0.0, inplace=True)
 
-    # Run the function
-    results_gdf = get_catchment_data_for_geojson_poly(dummy_geojson_path, con)
+    keep_ids = set(geoms.loc[geoms["pct"] >= overlap_threshold_percent, "catchment_id"])
+    filtered_geoms = geoms[geoms.catchment_id.isin(keep_ids)].drop(
+        columns=["area", "inter", "pct"]
+    )
+    filtered_attrs = attributes_df[attributes_df.catchment_id.isin(keep_ids)].copy()
 
-    if not results_gdf.empty:
-        print("\n--- Query Results (GeoDataFrame) ---")
-        print(results_gdf.head())
-        print(f"\nCRS of results: {results_gdf.crs}")
-    else:
-        print("\nNo results returned or an error occurred.")
+    stats["final_geoms"] = len(filtered_geoms)
+    stats["final_attrs"] = len(filtered_attrs)
+    stats["removed_geoms"] = stats["initial_geoms"] - stats["final_geoms"]
+    stats["removed_attrs"] = stats["initial_attrs"] - stats["final_attrs"]
 
-    # Clean up dummy file and close connection
-    os.remove(dummy_geojson_path)
+    return filtered_geoms, filtered_attrs, stats
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Fetch/filter catchments and write per-ID Parquet files"
+    )
+    p.add_argument("-g", "--geojson", required=True, help="Path to query GeoJSON")
+    p.add_argument("-d", "--db", required=True, help="Path to DuckDB file")
+    p.add_argument(
+        "-t",
+        "--threshold",
+        type=float,
+        default=10.0,
+        help="Min overlap % to keep a catchment",
+    )
+    p.add_argument(
+        "-o",
+        "--outdir",
+        required=True,
+        help="Directory to write <catchment_id>.parquet files",
+    )
+    args = p.parse_args()
+
+    # Connect & load extension
+    con = duckdb.connect(database=args.db, read_only=True)
+    try:
+        con.execute("LOAD spatial;")
+    except duckdb.Error:
+        logger.warning("Could not load DuckDB 'spatial' extension.")
+
+    # Fetch & filter
+    geoms, attrs, query_poly_5070 = get_catchment_data_for_geojson_poly_split(
+        args.geojson, con
+    )
+    if geoms.empty:
+        logger.info("No geometries found. Exiting.")
+        return
+
+    fg, fa, stats = filter_dataframes_by_overlap(
+        geoms, attrs, query_poly_5070, args.threshold
+    )
+    logger.info("Overlap filter summary: %s", stats)
+
+    # Prepare output directory
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Write one parquet per catchment_id (drop the catchment_id column inside each file)
+    for catch_id, group in fa.groupby("catchment_id"):
+        df = group.drop(columns=["catchment_id"])
+        out_path = outdir / f"{catch_id}.parquet"
+        df.to_parquet(str(out_path), index=False)
+        logger.info(
+            "Wrote %d rows for catchment '%s' → %s", len(df), catch_id, out_path
+        )
+
     con.close()
+
+
+if __name__ == "__main__":
+    main()
