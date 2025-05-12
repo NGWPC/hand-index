@@ -2,6 +2,7 @@
 import argparse
 import tempfile
 import shutil
+import os
 import yaml
 import uuid as py_uuid
 from decimal import Decimal, InvalidOperation
@@ -207,19 +208,25 @@ def generic_validate_and_write(
             print(f"wrote {len(valid)} rows → {tbl} (Parquet)")
 
 
-# If the path is S3, pull it down once into TMP and return a local path
 def fetch_local(path: str) -> str:
+    """If `path` is an S3 URL, download it atomically to a unique
+    temp file and return that local filename; otherwise return
+    `path` itself."""
     low = path.lower()
-    if low.startswith(("s3://", "s3a://")):
-        fs, anon_path = fsspec.core.url_to_fs(path)
-        name = Path(anon_path).name
-        local = Path(TMP.name) / name
-        if not local.exists():
-            with fs.open(anon_path, "rb") as src, open(local, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-        return str(local)
-    else:
+    if not low.startswith(("s3://", "s3a://")):
         return path
+
+    # Turn URL into a filesystem + "anonymous" path
+    fs, anon_path = fsspec.core.url_to_fs(path)
+
+    # Grab just the basename
+    basename = Path(anon_path).name
+
+    fd, local_path = tempfile.mkstemp(suffix=f"{basename}", dir=str(Path(TMP.name)))
+    os.close(fd)  # close the fd so fs.get can open it
+
+    fs.get(anon_path, local_path)
+    return local_path
 
 
 def list_branch_dirs(hand_dir: str) -> List[str]:
@@ -296,7 +303,7 @@ def process_branch(args: Tuple[str, str, str]) -> Tuple[
 
     if geoms:
         merged = unary_union(geoms)
-        cid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{hand_ver}:{merged.wkt}")
+        cid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{Path(uri)}:{merged.wkt}")
         catch_rec = {
             "catchment_id": cid,
             "hand_version_id": hand_ver,
@@ -319,8 +326,8 @@ def process_branch(args: Tuple[str, str, str]) -> Tuple[
             info = fs.info(anon_fp)
             try:
                 df_part = pd.read_csv(loc)
-            except Exception:
-                print(f"  skipping empty CSV: {uri}")
+            except Exception as e:
+                print(f"  couldn't read CSV: {uri} because of {e}")
                 continue
             pieces.append(pd.read_csv(loc))
         if pieces:
@@ -394,7 +401,7 @@ def process_branch(args: Tuple[str, str, str]) -> Tuple[
         rem_tif = rem_tifs[0]
         scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
         uri = f"{scheme}://{rem_tif}" if scheme != "file" else rem_tif
-        rid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{cid}:{Path(uri).name}")
+        rid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{cid}:{Path(uri)}")
         rem_ids.append(rid)
         rem_recs.append(
             {
@@ -422,7 +429,7 @@ def process_branch(args: Tuple[str, str, str]) -> Tuple[
         catch_tif = catch_tifs[0]
         scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
         uri = f"{scheme}://{catch_tif}" if scheme != "file" else catch_tif
-        crid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{rem_ids[0]}:{Path(uri).name}")
+        crid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{rem_ids[0]}:{Path(uri)}")
         cr_recs.append(
             {
                 "catchment_raster_id": crid,
