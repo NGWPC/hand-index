@@ -188,6 +188,7 @@ def generic_validate_and_write(
                 engine="pyarrow",
                 compression="snappy",
                 index=False,
+                write_covering_bbox=True,
             )
             register_parent_keys(gdf, tbl)
             print(f"wrote {len(valid)} rows → {tbl} (GeoParquet)")
