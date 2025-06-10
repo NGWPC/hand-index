@@ -21,9 +21,39 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(messag
 logger = logging.getLogger(__name__)
 
 
-def _common_cte(wkt4326: str) -> str:
+def create_partitioned_views(con: duckdb.DuckDBPyConnection, base_path: str):
     """
-    Returns the shared CTE for transforming the WKT and filtering catchments.
+    Create views for partitioned tables.
+    """
+    # Ensure base_path ends with /
+    if not base_path.endswith('/'):
+        base_path += '/'
+    
+    views_sql = f"""
+    CREATE OR REPLACE VIEW catchments_partitioned AS
+    SELECT * FROM read_parquet('{base_path}catchments/*/*.parquet', hive_partitioning = 1);
+    
+    CREATE OR REPLACE VIEW hydrotables_partitioned AS
+    SELECT * FROM read_parquet('{base_path}hydrotables/*/*.parquet', hive_partitioning = 1);
+    
+    CREATE OR REPLACE VIEW hand_rem_rasters_partitioned AS
+    SELECT * FROM read_parquet('{base_path}hand_rem_rasters.parquet');
+    
+    CREATE OR REPLACE VIEW hand_catchment_rasters_partitioned AS
+    SELECT * FROM read_parquet('{base_path}hand_catchment_rasters.parquet');
+    
+    CREATE OR REPLACE VIEW catchment_h3_lookup_partitioned AS
+    SELECT * FROM read_parquet('{base_path}catchment_h3_lookup.parquet');
+    """
+    
+    for stmt in views_sql.strip().split(';'):
+        if stmt.strip():
+            con.execute(stmt.strip() + ';')
+
+
+def _partitioned_query_cte(wkt4326: str, h3_resolution: int = 1) -> str:
+    """
+    Returns the CTE for querying partitioned tables using H3 spatial indexing.
     """
     return f"""
     WITH input_query AS (
@@ -37,19 +67,33 @@ def _common_cte(wkt4326: str) -> str:
         ) AS query_geom
       FROM input_query
     ),
+    query_h3_cells AS (
+      SELECT unnest(
+        h3_polygon_wkt_to_cells(
+          ST_AsText(ST_Transform((SELECT query_geom FROM transformed_query), 'EPSG:5070', 'EPSG:4326', true)),
+          {h3_resolution}
+        )
+      ) AS h3_query_cell_id
+    ),
+    candidate_catchment_ids AS (
+      SELECT DISTINCT chl.catchment_id
+      FROM catchment_h3_lookup_partitioned chl
+      JOIN query_h3_cells qhc ON chl.h3_covering_cell_key = qhc.h3_query_cell_id
+    ),
     filtered_catchments AS (
-      SELECT DISTINCT
+      SELECT
         c.catchment_id,
-        c.geometry
-      FROM catchments AS c
-      JOIN transformed_query AS tq
-        ON ST_Intersects(c.geometry, tq.query_geom)
+        c.geometry,
+        c.h3_partition_key
+      FROM catchments_partitioned c
+      JOIN candidate_catchment_ids cc ON c.catchment_id = cc.catchment_id
+      JOIN transformed_query tq ON ST_Intersects(c.geometry, tq.query_geom)
     )
     """
 
 
-def get_catchment_data_for_geojson_poly_split(
-    geojson_fp: str, con: duckdb.DuckDBPyConnection
+def get_catchment_data_for_geojson_poly_split_partitioned(
+    geojson_fp: str, con: duckdb.DuckDBPyConnection, h3_resolution: int = 1
 ) -> Tuple[gpd.GeoDataFrame, pd.DataFrame, Optional[Polygon]]:
     """
     Reads a GeoJSON polygon, runs two spatial queries against DuckDB
@@ -79,8 +123,8 @@ def get_catchment_data_for_geojson_poly_split(
     # Also get the same polygon in EPSG:5070 for Python overlap checks
     query_poly_5070 = gdf.to_crs(epsg=5070).geometry.iloc[0]
 
-    # 2) Build and run the geometry-only query
-    cte = _common_cte(wkt4326)
+    # 2) Build and run the geometry-only query using partitioned approach
+    cte = _partitioned_query_cte(wkt4326, h3_resolution)
     sql_geom = (
         cte
         + """
@@ -108,19 +152,21 @@ def get_catchment_data_for_geojson_poly_split(
         crs="EPSG:5070",
     )
 
-    # 3) Build and run the attribute query
+    # 3) Build and run the attribute query using partitioned tables
     sql_attr = (
         cte
         + """
     SELECT
-      f.catchment_id,
-      ht.* EXCLUDE (catchment_id),
-      hrr.raster_path   AS rem_raster_path,
-      hcr.raster_path   AS catchment_raster_path
-    FROM filtered_catchments AS f
-    LEFT JOIN hydrotables             AS ht   ON f.catchment_id = ht.catchment_id
-    LEFT JOIN hand_rem_rasters       AS hrr  ON f.catchment_id = hrr.catchment_id
-    LEFT JOIN hand_catchment_rasters AS hcr  ON hrr.rem_raster_id = hcr.rem_raster_id;
+      fc.catchment_id,
+      h.* EXCLUDE (catchment_id, h3_partition_key),
+      hrr.rem_raster_id,
+      hrr.raster_path AS rem_raster_path,
+      hcr.raster_path AS catchment_raster_path
+    FROM filtered_catchments AS fc
+    LEFT JOIN hydrotables_partitioned AS h ON fc.catchment_id = h.catchment_id 
+        AND fc.h3_partition_key = h.h3_partition_key
+    LEFT JOIN hand_rem_rasters_partitioned AS hrr ON fc.catchment_id = hrr.catchment_id
+    LEFT JOIN hand_catchment_rasters_partitioned AS hcr ON hrr.rem_raster_id = hcr.rem_raster_id;
     """
     )
     attributes_df = con.execute(sql_attr).fetch_df()
@@ -152,7 +198,7 @@ def filter_dataframes_by_overlap(
         lambda g: g.intersection(query_polygon_5070).area if not g.is_empty else 0.0
     )
     geoms["pct"] = (geoms["inter"] / geoms["area"].replace({0: pd.NA})) * 100
-    geoms["pct"].fillna(0.0, inplace=True)
+    geoms["pct"] = geoms["pct"].fillna(0.0)
 
     keep_ids = set(geoms.loc[geoms["pct"] >= overlap_threshold_percent, "catchment_id"])
     filtered_geoms = geoms[geoms.catchment_id.isin(keep_ids)].drop(
@@ -173,7 +219,11 @@ def main():
         description="Fetch/filter catchments and write per-ID Parquet files"
     )
     p.add_argument("-g", "--geojson", required=True, help="Path to query GeoJSON")
-    p.add_argument("-d", "--db", required=True, help="Path to DuckDB file")
+    p.add_argument(
+        "-p", "--partitioned-path", 
+        required=True,
+        help="Base path to partitioned parquet files (local path or s3://...)"
+    )
     p.add_argument(
         "-t",
         "--threshold",
@@ -187,18 +237,37 @@ def main():
         required=True,
         help="Directory to write <catchment_id>.parquet files",
     )
+    p.add_argument(
+        "--h3-resolution",
+        type=int,
+        default=1,
+        help="H3 resolution used for partitioning (default: 1)",
+    )
     args = p.parse_args()
 
-    # Connect & load extension
-    con = duckdb.connect(database=args.db, read_only=True)
+    # Connect to DuckDB in-memory for partitioned mode
+    con = duckdb.connect(":memory:")
+    logger.info("Using partitioned mode with path: %s", args.partitioned_path)
+
+    # Load required extensions
     try:
         con.execute("LOAD spatial;")
-    except duckdb.Error:
-        logger.warning("Could not load DuckDB 'spatial' extension.")
+        con.execute("INSTALL httpfs;")
+        con.execute("LOAD httpfs;") 
+        con.execute("INSTALL aws;")
+        con.execute("LOAD aws;")
+        con.execute("INSTALL h3 FROM community;")
+        con.execute("LOAD h3;")
+    except duckdb.Error as e:
+        logger.warning("Could not load DuckDB extensions: %s", e)
+
+    # Setup views for partitioned mode
+    logger.info("Creating views for partitioned tables...")
+    create_partitioned_views(con, args.partitioned_path)
 
     # Fetch & filter
-    geoms, attrs, query_poly_5070 = get_catchment_data_for_geojson_poly_split(
-        args.geojson, con
+    geoms, attrs, query_poly_5070 = get_catchment_data_for_geojson_poly_split_partitioned(
+        args.geojson, con, args.h3_resolution
     )
     if geoms.empty:
         logger.info("No geometries found. Exiting.")
@@ -215,7 +284,14 @@ def main():
 
     # Write one parquet per catchment_id (drop the catchment_id column inside each file)
     for catch_id, group in fa.groupby("catchment_id"):
-        df = group.drop(columns=["catchment_id"])
+        df = group.drop(columns=["catchment_id"]).copy()
+        
+        # Convert UUID columns to strings for Parquet compatibility
+        uuid_columns = ['rem_raster_id', 'catchment_raster_id']
+        for col in uuid_columns:
+            if col in df.columns:
+                df[col] = df[col].astype(str)
+        
         out_path = outdir / f"{catch_id}.parquet"
         df.to_parquet(str(out_path), index=False)
         logger.info(
