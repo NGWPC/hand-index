@@ -1,12 +1,12 @@
-version: '3.8'
 services:
-  db:
-    image: postgis/postgis:16-3.4
-    environment:
-      POSTGRES_PASSWORD: test
-      POSTGRES_USER: test
-      POSTGRES_DB: test-hand-db
+  load-dev:
+    build: .
+    entrypoint: [ sleep, infinity ]
     volumes:
-      - ./pg_volume:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+      - .:/app
+    environment:
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+    env_file:
+      - .env
