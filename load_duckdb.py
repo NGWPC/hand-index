@@ -339,6 +339,159 @@ def load_hand_suite(
     print(f"Successfully processed {successful}/{len(branch_dirs)} branches")
 
 
+def partition_tables_to_parquet(db_path: str, output_dir: str, h3_resolution: int = 1):
+    """Partition tables from DuckDB to parquet files using H3 spatial indexing."""
+    conn = duckdb.connect(db_path)
+    
+    # Load required extensions
+    print("Loading DuckDB extensions...")
+    try:
+        conn.execute("INSTALL httpfs;")
+        conn.execute("LOAD httpfs;")
+        conn.execute("INSTALL aws;")
+        conn.execute("LOAD aws;")
+        conn.execute("INSTALL spatial;")
+        conn.execute("LOAD spatial;")
+        conn.execute("INSTALL h3 FROM community;")
+        conn.execute("LOAD h3;")
+    except Exception as e:
+        print(f"Error loading extensions: {e}")
+        raise
+    
+    # Configure AWS settings if using S3
+    if output_dir.startswith('s3://'):
+        print("Configuring AWS settings for S3 access...")
+        try:
+            # Try to configure AWS credentials from environment or AWS config
+            conn.execute("SET s3_region='us-east-1';")  # Default region
+            # You may need to set these if not using default AWS credentials
+            # conn.execute("SET s3_access_key_id='your-access-key';")
+            # conn.execute("SET s3_secret_access_key='your-secret-key';")
+        except Exception as e:
+            print(f"Warning: Could not configure AWS settings: {e}")
+    
+    # Test S3 connectivity if using S3
+    if output_dir.startswith('s3://'):
+        print("Testing S3 connectivity...")
+        try:
+            # Try a simple operation to test connectivity
+            conn.execute("SELECT 1;")
+        except Exception as e:
+            print(f"Error with S3 connectivity test: {e}")
+            print("Make sure your AWS credentials are configured (aws configure) and you have write access to the S3 bucket.")
+            raise
+    
+    # Create indexes if they don't exist
+    try:
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS catchments_geom_idx
+              ON catchments
+              USING RTREE (geometry);
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hydro_catchment_id ON hydrotables (catchment_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hrr_catchment_id ON hand_rem_rasters (catchment_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hcr_rem_raster_id ON hand_catchment_rasters (rem_raster_id);")
+    except Exception as e:
+        print(f"Warning: Could not create indexes: {e}")
+    
+    # Set H3 resolution variable
+    conn.execute(f"SET VARIABLE h3_resolution = {h3_resolution};")
+    
+    # Ensure output directory ends with /
+    if not output_dir.endswith('/'):
+        output_dir += '/'
+    
+    print("Partitioning catchments table...")
+    # Partition catchments with H3 spatial indexing
+    conn.execute(f"""
+        COPY (
+            SELECT
+                c.*,
+                -- Get centroid, transform to EPSG:4326, then get H3 cell at resolution {h3_resolution}
+                h3_latlng_to_cell(
+                    ST_Y(ST_Transform(ST_Centroid(c.geometry), 'EPSG:5070', 'EPSG:4326', true)), -- Latitude
+                    ST_X(ST_Transform(ST_Centroid(c.geometry), 'EPSG:5070', 'EPSG:4326', true)), -- Longitude
+                    getvariable('h3_resolution')
+                ) AS h3_partition_key
+            FROM catchments c
+        ) TO '{output_dir}catchments/'
+        WITH (FORMAT PARQUET, PARTITION_BY (h3_partition_key), OVERWRITE_OR_IGNORE 1);
+    """)
+    
+    print("Creating catchment H3 mapping...")
+    # Create temp table for catchment to H3 mapping
+    conn.execute(f"""
+        CREATE TEMP TABLE catchment_h3_map AS
+        SELECT
+            catchment_id,
+            h3_latlng_to_cell(
+                ST_Y(ST_Transform(ST_Centroid(geometry), 'EPSG:5070', 'EPSG:4326', true)),
+                ST_X(ST_Transform(ST_Centroid(geometry), 'EPSG:5070', 'EPSG:4326', true)),
+                getvariable('h3_resolution')
+            ) AS h3_partition_key
+        FROM catchments;
+    """)
+    
+    print("Partitioning hydrotables...")
+    # Partition hydrotables
+    conn.execute(f"""
+        COPY (
+            SELECT
+                ht.*,
+                chm.h3_partition_key
+            FROM hydrotables ht
+            JOIN catchment_h3_map chm ON ht.catchment_id = chm.catchment_id
+        ) TO '{output_dir}hydrotables/'
+        WITH (FORMAT PARQUET, PARTITION_BY (h3_partition_key), OVERWRITE_OR_IGNORE 1);
+    """)
+    
+    print("Exporting HAND REM rasters (unpartitioned)...")
+    # Export hand_rem_rasters as single parquet file
+    conn.execute(f"""
+        COPY hand_rem_rasters TO '{output_dir}hand_rem_rasters.parquet'
+        WITH (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1);
+    """)
+    
+    print("Exporting HAND catchment rasters (unpartitioned)...")
+    # Export hand_catchment_rasters as single parquet file
+    conn.execute(f"""
+        COPY hand_catchment_rasters TO '{output_dir}hand_catchment_rasters.parquet'
+        WITH (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1);
+    """)
+    
+    print("Creating catchment H3 lookup table...")
+    # Create H3 lookup table
+    conn.execute(f"""
+        COPY (
+            WITH CatchmentCentroids AS (
+                -- First, get the H3 cell for the centroid of each catchment
+                SELECT
+                    c.catchment_id,
+                    h3_latlng_to_cell(
+                        ST_Y(ST_Transform(ST_Centroid(c.geometry), 'EPSG:5070', 'EPSG:4326', true)), -- Latitude
+                        ST_X(ST_Transform(ST_Centroid(c.geometry), 'EPSG:5070', 'EPSG:4326', true)), -- Longitude
+                        getvariable('h3_resolution')
+                    ) as h3_centroid_cell
+                FROM catchments c
+                WHERE c.geometry IS NOT NULL AND NOT ST_IsEmpty(c.geometry)
+            )
+            SELECT
+                cc.catchment_id,
+                -- For each centroid cell, get the cell itself and all neighbors in a 1-cell radius (k=1)
+                unnest(h3_grid_disk(cc.h3_centroid_cell, 1)) AS h3_covering_cell_key
+            FROM
+                CatchmentCentroids cc
+        ) TO '{output_dir}catchment_h3_lookup.parquet'
+        WITH (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1);
+    """)
+    
+    # Clean up temp tables
+    conn.execute("DROP TABLE IF EXISTS catchment_h3_map;")
+    
+    conn.close()
+    print(f"Tables partitioned successfully to: {output_dir}")
+
+
 def main():
     try:
         p = argparse.ArgumentParser()
@@ -362,18 +515,49 @@ def main():
             action="store_true",
             help="Initialize database with schema (use for new databases)",
         )
+        p.add_argument(
+            "--output-dir",
+            help="Output directory for partitioned parquet files (local path or s3://…). If provided, will partition tables after loading.",
+        )
+        p.add_argument(
+            "--skip-load",
+            action="store_true",
+            help="Skip loading data to .ddb file if it already exists, only partition existing .ddb",
+        )
+        p.add_argument(
+            "--h3-resolution",
+            type=int,
+            default=1,
+            help="H3 resolution for spatial partitioning (default: 1)",
+        )
         args = p.parse_args()
 
+        # Check if database exists for skip-load option
+        db_exists = os.path.exists(args.db_path)
+        
         # Initialize database if requested
         if args.init_db:
             initialize_database(args.db_path, args.schema_path)
 
-        hand_ver = args.hand_version
-        nwm_ver = Decimal(args.nwm_version)
+        # Load data if not skipping or if database doesn't exist
+        if not args.skip_load or not db_exists:
+            hand_ver = args.hand_version
+            nwm_ver = Decimal(args.nwm_version)
+            
+            if args.skip_load and not db_exists:
+                print(f"Warning: --skip-load specified but database {args.db_path} does not exist. Loading data...")
+            
+            load_hand_suite(args.db_path, args.hand_dir, hand_ver, nwm_ver)
+            print(f"\nData loaded into {args.db_path}")
+        else:
+            print(f"Skipping data load, using existing database: {args.db_path}")
 
-        load_hand_suite(args.db_path, args.hand_dir, hand_ver, nwm_ver)
+        # Partition tables if output directory is provided
+        if args.output_dir:
+            print(f"\nPartitioning tables to: {args.output_dir}")
+            partition_tables_to_parquet(args.db_path, args.output_dir, args.h3_resolution)
 
-        print(f"\nDONE. Data loaded into {args.db_path}")
+        print(f"\nDONE.")
 
     finally:
         if TMP:
