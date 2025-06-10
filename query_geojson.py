@@ -181,7 +181,13 @@ def filter_dataframes_by_overlap(
     overlap_threshold_percent: float = 10.0,
 ) -> Tuple[gpd.GeoDataFrame, pd.DataFrame, Dict[str, int]]:
     """
-    Filters geometries and attributes by the % overlap with query_polygon_5070.
+    Filters geometries and attributes using contains/within/overlap logic.
+    
+    Selection criteria:
+    - Catchments that completely contain the query polygon, OR
+    - Catchments that are completely within the query polygon, OR  
+    - Catchments that overlap more than the threshold percentage of their own area
+    
     Returns (filtered_geoms, filtered_attrs, summary_stats).
     """
     stats = {
@@ -193,23 +199,48 @@ def filter_dataframes_by_overlap(
         return geometries_gdf.copy(), attributes_df.copy(), stats
 
     geoms = geometries_gdf.copy()
+    
+    # Compute geometric relationships
     geoms["area"] = geoms.geometry.area
     geoms["inter"] = geoms.geometry.apply(
         lambda g: g.intersection(query_polygon_5070).area if not g.is_empty else 0.0
     )
-    geoms["pct"] = (geoms["inter"] / geoms["area"].replace({0: pd.NA})) * 100
-    geoms["pct"] = geoms["pct"].fillna(0.0)
-
-    keep_ids = set(geoms.loc[geoms["pct"] >= overlap_threshold_percent, "catchment_id"])
+    geoms["overlap_pct"] = (geoms["inter"] / geoms["area"].replace({0: pd.NA})) * 100
+    geoms["overlap_pct"] = geoms["overlap_pct"].fillna(0.0)
+    
+    # Check contains/within relationships
+    geoms["contains_query"] = geoms.geometry.apply(lambda g: g.contains(query_polygon_5070))
+    geoms["within_query"] = geoms.geometry.apply(lambda g: g.within(query_polygon_5070))
+    
+    # Debug: log the geometric relationships
+    contains_count = geoms["contains_query"].sum()
+    within_count = geoms["within_query"].sum()
+    logger.info(f"Geometric relationships: {contains_count} contain query, {within_count} within query")
+    
+    # Apply selection criteria: contains OR within OR overlap > threshold
+    overlap_threshold_decimal = overlap_threshold_percent / 100.0
+    selection_mask = (
+        geoms["contains_query"] |
+        geoms["within_query"] |
+        (geoms["overlap_pct"] >= overlap_threshold_percent)
+    )
+    
+    keep_ids = set(geoms.loc[selection_mask, "catchment_id"])
     filtered_geoms = geoms[geoms.catchment_id.isin(keep_ids)].drop(
-        columns=["area", "inter", "pct"]
+        columns=["area", "inter", "overlap_pct", "contains_query", "within_query"]
     )
     filtered_attrs = attributes_df[attributes_df.catchment_id.isin(keep_ids)].copy()
 
+    # Enhanced statistics
     stats["final_geoms"] = len(filtered_geoms)
     stats["final_attrs"] = len(filtered_attrs)
     stats["removed_geoms"] = stats["initial_geoms"] - stats["final_geoms"]
     stats["removed_attrs"] = stats["initial_attrs"] - stats["final_attrs"]
+    stats["contains_count"] = geoms["contains_query"].sum()
+    stats["within_count"] = geoms["within_query"].sum()
+    stats["overlap_only_count"] = ((geoms["overlap_pct"] >= overlap_threshold_percent) & 
+                                   ~geoms["contains_query"] & 
+                                   ~geoms["within_query"]).sum()
 
     return filtered_geoms, filtered_attrs, stats
 
