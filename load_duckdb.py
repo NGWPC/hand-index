@@ -11,6 +11,8 @@ import concurrent.futures
 from pyogrio.errors import DataSourceError
 import fiona
 import threading
+import queue
+import time
 
 import pandas as pd
 import geopandas as gpd
@@ -19,18 +21,34 @@ from shapely.ops import unary_union
 import duckdb
 import fsspec
 
-# Global thread-local storage for DuckDB connections
-thread_local = threading.local()
+# Connection pool for DuckDB connections
+connection_pool = queue.Queue()
+pool_initialized = False
+pool_lock = threading.Lock()
 
 TMP = tempfile.TemporaryDirectory()
 
 
-def get_connection(db_path: str) -> duckdb.DuckDBPyConnection:
-    """Get a thread-local DuckDB connection."""
-    if not hasattr(thread_local, "connection"):
-        thread_local.connection = duckdb.connect(db_path)
-        thread_local.connection.execute("LOAD spatial;")
-    return thread_local.connection
+def initialize_connection_pool(db_path: str, pool_size: int = 8):
+    """Initialize the connection pool."""
+    global pool_initialized
+    with pool_lock:
+        if not pool_initialized:
+            for _ in range(pool_size):
+                conn = duckdb.connect(db_path)
+                conn.execute("LOAD spatial;")
+                connection_pool.put(conn)
+            pool_initialized = True
+
+
+def get_connection() -> duckdb.DuckDBPyConnection:
+    """Get a connection from the pool."""
+    return connection_pool.get()
+
+
+def return_connection(conn: duckdb.DuckDBPyConnection):
+    """Return a connection to the pool."""
+    connection_pool.put(conn)
 
 
 def initialize_database(db_path: str, schema_path: str):
@@ -97,13 +115,13 @@ def read_gpkg_fallback(path: str) -> gpd.GeoDataFrame:
             return gpd.GeoDataFrame.from_features(src, crs=src.crs)
 
 
-def process_branch(args: Tuple[str, str, str, str]) -> bool:
+def process_branch(args: Tuple[str, str, str]) -> bool:
     """Process one branch directory and insert data into DuckDB."""
-    d, hand_ver, nwm_ver_str, db_path = args
+    d, hand_ver, nwm_ver_str = args
     print(f"Processing branch: {d}")
     nwm_ver = Decimal(nwm_ver_str)
 
-    conn = get_connection(db_path)
+    conn = get_connection()
 
     try:
         conn.execute("BEGIN TRANSACTION;")
@@ -289,6 +307,8 @@ def process_branch(args: Tuple[str, str, str, str]) -> bool:
             pass
         print(f"  ERROR processing branch {d}: {e}")
         return False
+    finally:
+        return_connection(conn)
 
 
 def load_hand_suite(
@@ -298,6 +318,9 @@ def load_hand_suite(
     nwm_ver: Decimal,
 ):
     """Load HAND data suite into DuckDB."""
+    # Initialize connection pool
+    initialize_connection_pool(db_path, pool_size=8)
+
     # Find all branch dirs
     branch_dirs = list_branch_dirs(hand_dir)
     if not branch_dirs:
@@ -307,9 +330,9 @@ def load_hand_suite(
     print(f"Found {len(branch_dirs)} branch directories to process")
 
     # Process in parallel
-    args_list = [(d, hand_ver, str(nwm_ver), db_path) for d in branch_dirs]
+    args_list = [(d, hand_ver, str(nwm_ver)) for d in branch_dirs]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         results = list(executor.map(process_branch, args_list))
 
     successful = sum(results)
