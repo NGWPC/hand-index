@@ -1,6 +1,5 @@
 pg_volume/
 test_data/
 .venv/
-CLAUDE.md
 *.ddb*
 
