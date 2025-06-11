@@ -55,6 +55,160 @@ def return_connection(conn: duckdb.DuckDBPyConnection):
     connection_pool.put(conn)
 
 
+def detect_hydrotable_schema(csv_files: List[str]) -> Dict[str, str]:
+    """
+    Analyze CSV files to detect all unique columns and their types.
+    Returns a mapping of column names to SQL types.
+    """
+    all_columns = set()
+    sample_data = {}
+
+    for csv_file in csv_files[:3]:  # Sample first 3 files
+        try:
+            df = pd.read_csv(csv_file, nrows=100)  # Sample first 100 rows
+            all_columns.update(df.columns)
+            for col in df.columns:
+                if col not in sample_data:
+                    sample_data[col] = df[col].dropna().tolist()
+                else:
+                    sample_data[col].extend(df[col].dropna().tolist()[:10])
+        except Exception as e:
+            print(f"Warning: Could not sample {csv_file}: {e}")
+            continue
+
+    # Determine column types
+    schema = {}
+    for col in all_columns:
+        if col.lower() in ["hydroid", "huc", "lakeid"]:
+            schema[col] = "TEXT"
+        elif col.lower() in ["feature_id"]:
+            schema[col] = "BIGINT"
+        elif col.lower() == "stage" or "discharge" in col.lower():
+            schema[col] = "DECIMAL[]"  # Array for aggregated values
+        elif "calb" in col.lower():
+            if col.lower() == "calb_applied":
+                schema[col] = "BOOLEAN"  # Boolean for calibration applied flag
+            else:
+                schema[col] = "DECIMAL[]"  # Array for other calibration values
+        else:
+            # Try to infer type from sample data
+            if col in sample_data and sample_data[col]:
+                try:
+                    pd.to_numeric(sample_data[col])
+                    schema[col] = "DECIMAL"
+                except:
+                    schema[col] = "TEXT"
+            else:
+                schema[col] = "TEXT"
+
+    return schema
+
+
+def adapt_hydrotable_schema(
+    conn: duckdb.DuckDBPyConnection, new_schema: Dict[str, str], hand_ver: str
+):
+    """
+    Adapt the Hydrotables schema to include new columns discovered in the CSV files.
+    """
+    # Get current schema
+    try:
+        current_cols = conn.execute("DESCRIBE Hydrotables").fetchall()
+        current_schema = {row[0]: row[1] for row in current_cols}
+    except:
+        current_schema = {}
+
+    # Find new columns that need to be added
+    new_columns = []
+    for col_name, col_type in new_schema.items():
+        # Skip core columns that are always present
+        if col_name.lower() in ["hydroid", "stage", "feature_id", "huc", "lakeid"]:
+            continue
+
+        # Check if this is a discharge or calb column
+        if "discharge" in col_name.lower() or "calb" in col_name.lower():
+            if col_name not in current_schema:
+                new_columns.append((col_name, col_type))
+
+    # Add new columns
+    for col_name, col_type in new_columns:
+        try:
+            alter_sql = f"ALTER TABLE Hydrotables ADD COLUMN {col_name} {col_type}"
+            conn.execute(alter_sql)
+            print(f"Added new column: {col_name} ({col_type})")
+        except Exception as e:
+            print(f"Warning: Could not add column {col_name}: {e}")
+
+
+def process_hydrotable_data(
+    df: pd.DataFrame, detected_schema: Dict[str, str]
+) -> pd.DataFrame:
+    """
+    Process hydrotable dataframe with dynamic column handling.
+    """
+    # Check required columns exist
+    required_cols = ["stage", "feature_id", "HydroID", "HUC", "LakeID"]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+
+    # Convert core columns
+    df["stage"] = pd.to_numeric(df["stage"], errors="coerce")
+    df["feature_id"] = pd.to_numeric(df["feature_id"], errors="coerce")
+    df["HydroID"] = df["HydroID"].astype(str)
+
+    # Convert numeric columns (discharge and calb columns)
+    for col in df.columns:
+        if "discharge" in col.lower():
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        elif "calb" in col.lower():
+            if col.lower() == "calb_applied":
+                # Convert to boolean - handle various boolean representations
+                df[col] = df[col].map(lambda x: 
+                    True if str(x).lower() in ['true', '1', 'yes', 'y'] 
+                    else False if str(x).lower() in ['false', '0', 'no', 'n']
+                    else None)
+            else:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Create aggregation dictionary - keys must be actual column names in dataframe
+    agg_dict = {
+        "feature_id": lambda s: s.dropna().iloc[0] if not s.dropna().empty else None,
+        "HUC": lambda s: s.dropna().iloc[0] if not s.dropna().empty else None,
+        "LakeID": lambda s: s.dropna().iloc[0] if not s.dropna().empty else None,
+        "stage": lambda v: [float(x) for x in v.dropna() if pd.notna(x)] if any(pd.notna(x) for x in v) else None,
+    }
+
+    # Add dynamic discharge and calb columns
+    def make_aggregator(column_name):
+        def aggregator(v):
+            clean_values = [float(x) for x in v.dropna() if pd.notna(x)]
+            return clean_values if clean_values else None  # Return None instead of empty array
+        return aggregator
+    
+    def make_boolean_aggregator(column_name):
+        return lambda v: v.dropna().iloc[0] if not v.dropna().empty else None
+
+    for col in df.columns:
+        if "discharge" in col.lower():
+            agg_dict[col] = make_aggregator(col)
+        elif "calb" in col.lower():
+            if col.lower() == "calb_applied":
+                agg_dict[col] = make_boolean_aggregator(col)
+            else:
+                agg_dict[col] = make_aggregator(col)
+
+    # Group and aggregate
+    df = df.sort_values(["HydroID", "stage"])
+    try:
+        grp = df.groupby("HydroID").agg(agg_dict).reset_index()
+        return grp
+    except Exception as e:
+        print(f"  Aggregation failed: {e}")
+        print(f"  DataFrame columns: {list(df.columns)}")
+        print(f"  Aggregation dict: {agg_dict}")
+        raise
+
+
 def initialize_database(db_path: str, schema_path: str):
     """Initialize the DuckDB database with schema."""
     conn = duckdb.connect(db_path)
@@ -119,19 +273,13 @@ def read_gpkg_fallback(path: str) -> gpd.GeoDataFrame:
             return gpd.GeoDataFrame.from_features(src, crs=src.crs)
 
 
-def process_branch(args: Tuple[str, str, str]) -> bool:
-    """Process one branch directory and insert data into DuckDB."""
+def process_branch(args: Tuple[str, str, str]) -> Optional[Dict[str, Any]]:
+    """Process one branch directory and return data for batch insertion."""
     d, hand_ver, nwm_ver_str = args
     print(f"Processing branch: {d}")
     nwm_ver = Decimal(nwm_ver_str)
 
-    conn = get_connection()
-
     try:
-        conn.execute("BEGIN TRANSACTION;")
-
-        # Note: Hand_Versions table removed from schema
-
         # Process catchment geometry union
         fs, anon = fsspec.core.url_to_fs(d)
         gpkg_list = fs.glob(f"{anon}/*gw_catchments*.gpkg")
@@ -155,104 +303,99 @@ def process_branch(args: Tuple[str, str, str]) -> bool:
 
         if not geoms:
             print(f"  No catchment geometries found in {d}")
-            conn.execute("ROLLBACK;")
-            return False
+            return None
 
-        # Create catchment record
+        # Create catchment record data
         merged = unary_union(geoms)
         parts = d.split(f"{hand_ver}/", 1)
         rel_uri = f"{hand_ver}/{parts[1]}" if len(parts) == 2 else d
         cid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{Path(rel_uri)}:{merged.wkt}")
 
-        # Insert catchment (ignore if already exists)
-        conn.execute(
-            """
-            INSERT INTO Catchments (catchment_id, hand_version_id, geometry, additional_attributes)
-            VALUES (?, ?, ST_GeomFromText(?), ?)
-            ON CONFLICT (catchment_id) DO NOTHING
-        """,
-            [str(cid), hand_ver, merged.wkt, None],
-        )
+        # Prepare result data structure
+        result_data = {
+            "catchment": {
+                "catchment_id": str(cid),
+                "hand_version_id": hand_ver,
+                "geometry_wkt": merged.wkt,
+                "additional_attributes": None,
+            },
+            "hydrotables": [],
+            "rem_rasters": [],
+            "catchment_rasters": [],
+        }
 
-        # Process hydrotables
+        # Process hydrotables with dynamic schema detection
         csvs = fs.glob(f"{anon}/hydroTable_*.csv")
         if csvs:
-            pieces = []
+            # Download all CSV files first for schema detection
+            local_csv_files = []
             for anon_fp in csvs:
                 scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
                 uri = f"{scheme}://{anon_fp}" if scheme != "file" else anon_fp
                 loc = fetch_local(uri)
+                local_csv_files.append(loc)
+
+            # Detect schema from CSV files
+            detected_schema = detect_hydrotable_schema(local_csv_files)
+
+            # Store schema info for later batch schema adaptation
+            result_data["detected_schema"] = detected_schema
+
+            # Process CSV files
+            pieces = []
+            for loc in local_csv_files:
                 try:
                     df_part = pd.read_csv(loc)
                     pieces.append(df_part)
                 except Exception as e:
-                    print(f"  couldn't read CSV: {uri} because of {e}")
+                    print(f"  couldn't read CSV: {loc} because of {e}")
                 finally:
                     if os.path.exists(loc):
                         os.remove(loc)
 
             if pieces:
                 df = pd.concat(pieces, ignore_index=True)
-                df["stage"] = pd.to_numeric(df["stage"], errors="coerce")
-                df["discharge_cms"] = pd.to_numeric(
-                    df["discharge_cms"], errors="coerce"
-                )
-                df["feature_id"] = pd.to_numeric(df["feature_id"], errors="coerce")
-                df["HydroID"] = df["HydroID"].astype(str)
 
-                def first_notnull(s):
-                    return s.dropna().iloc[0] if not s.dropna().empty else None
+                # Process data with dynamic column handling
+                grp = process_hydrotable_data(df, detected_schema)
 
-                df = df.sort_values(["HydroID", "stage"])
-                grp = (
-                    df.groupby("HydroID")
-                    .agg(
-                        nwm_feature_id_agg=("feature_id", first_notnull),
-                        huc_id_agg=("HUC", first_notnull),
-                        lake_id_agg=("LakeID", first_notnull),
-                        stage_list=("stage", lambda v: [float(x) for x in v.dropna()]),
-                        discharge_list=(
-                            "discharge_cms",
-                            lambda v: [float(x) for x in v.dropna()],
-                        ),
-                    )
-                    .reset_index()
-                )
-
-                # Insert hydrotable records
+                # Collect hydrotable records for batch insertion
                 for _, r in grp.iterrows():
-                    conn.execute(
-                        """
-                        INSERT INTO Hydrotables (
-                            catchment_id, hand_version_id, HydroID, nwm_feature_id, 
-                            nwm_version_id, stage, discharge_cms, huc_id, lake_id
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING
-                    """,
-                        [
-                            str(cid),
-                            hand_ver,
-                            r["HydroID"],
-                            (
-                                int(r["nwm_feature_id_agg"])
-                                if pd.notna(r["nwm_feature_id_agg"])
-                                else None
-                            ),
-                            (
-                                float(nwm_ver)
-                                if pd.notna(r["nwm_feature_id_agg"])
-                                else None
-                            ),
-                            r["stage_list"],
-                            r["discharge_list"],
-                            str(r["huc_id_agg"]) if pd.notna(r["huc_id_agg"]) else None,
-                            (
-                                str(r["lake_id_agg"])
-                                if pd.notna(r["lake_id_agg"])
-                                else None
-                            ),
-                        ],
-                    )
+                    hydrotable_record = {
+                        "catchment_id": str(cid),
+                        "hand_version_id": hand_ver,
+                        "HydroID": r["HydroID"],
+                        "nwm_feature_id": (
+                            int(r["feature_id"])
+                            if "feature_id" in r.index and pd.notna(r["feature_id"])
+                            else None
+                        ),
+                        "nwm_version_id": (
+                            float(nwm_ver)
+                            if "feature_id" in r.index and pd.notna(r["feature_id"])
+                            else None
+                        ),
+                        "stage": r["stage"] if "stage" in r.index else None,
+                        "huc_id": (
+                            str(r["HUC"])
+                            if "HUC" in r.index and pd.notna(r["HUC"])
+                            else None
+                        ),
+                        "lake_id": (
+                            str(r["LakeID"])
+                            if "LakeID" in r.index and pd.notna(r["LakeID"])
+                            else None
+                        ),
+                    }
+
+                    # Add dynamic discharge and calb columns
+                    for col in grp.columns:
+                        if (
+                            "discharge" in col.lower() or "calb" in col.lower()
+                        ) and col not in hydrotable_record:
+                            hydrotable_record[col] = r[col] if col in r.index else None
+
+                    result_data["hydrotables"].append(hydrotable_record)
 
         # Process REM rasters
         rem_tifs = fs.glob(f"{anon}/*rem_zeroed*.tif")
@@ -269,13 +412,15 @@ def process_branch(args: Tuple[str, str, str]) -> bool:
             rid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{cid}:{Path(rel_uri)}")
             rem_ids.append(rid)
 
-            conn.execute(
-                """
-                INSERT INTO HAND_REM_Rasters (rem_raster_id, catchment_id, hand_version_id, raster_path, metadata)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT (rem_raster_id) DO NOTHING
-            """,
-                [str(rid), str(cid), hand_ver, uri, None],
+            # Collect REM raster data
+            result_data["rem_rasters"].append(
+                {
+                    "rem_raster_id": str(rid),
+                    "catchment_id": str(cid),
+                    "hand_version_id": hand_ver,
+                    "raster_path": uri,
+                    "metadata": None,
+                }
             )
 
         # Process catchment rasters
@@ -291,28 +436,177 @@ def process_branch(args: Tuple[str, str, str]) -> bool:
             rel_uri = f"{hand_ver}/{parts[1]}" if len(parts) == 2 else uri
             crid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{rem_ids[0]}:{Path(rel_uri)}")
 
-            conn.execute(
-                """
-                INSERT INTO HAND_Catchment_Rasters (catchment_raster_id, rem_raster_id, raster_path, metadata)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT (catchment_raster_id) DO NOTHING
-            """,
-                [str(crid), str(rem_ids[0]), uri, None],
+            # Collect catchment raster data
+            result_data["catchment_rasters"].append(
+                {
+                    "catchment_raster_id": str(crid),
+                    "rem_raster_id": str(rem_ids[0]),
+                    "raster_path": uri,
+                    "metadata": None,
+                }
             )
 
-        conn.execute("COMMIT;")
         print(f"  Successfully processed branch: {d}")
-        return True
+        return result_data
 
     except Exception as e:
-        try:
-            conn.execute("ROLLBACK;")
-        except:
-            pass
         print(f"  ERROR processing branch {d}: {e}")
-        return False
+        return None
+
+
+def batch_insert_data(
+    db_path: str, batch_data: List[Dict[str, Any]], batch_size: int = 100
+):
+    """
+    Perform batch insertions into the database.
+    """
+    if not batch_data:
+        return
+
+    conn = duckdb.connect(db_path)
+
+    try:
+        # Load required extensions
+        conn.execute("INSTALL spatial;")
+        conn.execute("LOAD spatial;")
+    except:
+        pass
+
+    try:
+        conn.execute("BEGIN TRANSACTION;")
+
+        # Collect all unique schemas for adaptation
+        all_schemas = {}
+        for data in batch_data:
+            if "detected_schema" in data:
+                all_schemas.update(data["detected_schema"])
+
+        # Adapt schema once for all new columns
+        if all_schemas:
+            adapt_hydrotable_schema(conn, all_schemas, "batch")
+
+        # Batch insert catchments
+        catchment_records = []
+        for data in batch_data:
+            if data and "catchment" in data:
+                catchment_records.append(data["catchment"])
+
+        if catchment_records:
+            print(f"Batch inserting {len(catchment_records)} catchments...")
+            for record in catchment_records:
+                conn.execute(
+                    """
+                    INSERT INTO Catchments (catchment_id, hand_version_id, geometry, additional_attributes)
+                    VALUES (?, ?, ST_GeomFromText(?), ?)
+                    ON CONFLICT (catchment_id) DO NOTHING
+                    """,
+                    [
+                        record["catchment_id"],
+                        record["hand_version_id"],
+                        record["geometry_wkt"],
+                        record["additional_attributes"],
+                    ],
+                )
+
+        # Batch insert hydrotables
+        all_hydrotable_records = []
+        for data in batch_data:
+            if data and "hydrotables" in data:
+                all_hydrotable_records.extend(data["hydrotables"])
+
+        if all_hydrotable_records:
+            print(
+                f"Batch inserting {len(all_hydrotable_records)} hydrotable records..."
+            )
+
+            # Build dynamic column list from first record
+            if all_hydrotable_records:
+                sample_record = all_hydrotable_records[0]
+                core_columns = [
+                    "catchment_id",
+                    "hand_version_id",
+                    "HydroID",
+                    "nwm_feature_id",
+                    "nwm_version_id",
+                    "stage",
+                    "huc_id",
+                    "lake_id",
+                ]
+                dynamic_columns = [
+                    k
+                    for k in sample_record.keys()
+                    if k not in core_columns
+                    and ("discharge" in k.lower() or "calb" in k.lower())
+                ]
+                all_columns = core_columns + dynamic_columns
+                placeholders = ", ".join(["?"] * len(all_columns))
+
+                insert_sql = f"""
+                    INSERT INTO Hydrotables ({', '.join(all_columns)})
+                    VALUES ({placeholders})
+                    ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING
+                """
+
+                for record in all_hydrotable_records:
+                    values = [record.get(col) for col in all_columns]
+                    conn.execute(insert_sql, values)
+
+        # Batch insert REM rasters
+        all_rem_rasters = []
+        for data in batch_data:
+            if data and "rem_rasters" in data:
+                all_rem_rasters.extend(data["rem_rasters"])
+
+        if all_rem_rasters:
+            print(f"Batch inserting {len(all_rem_rasters)} REM rasters...")
+            for record in all_rem_rasters:
+                conn.execute(
+                    """
+                    INSERT INTO HAND_REM_Rasters (rem_raster_id, catchment_id, hand_version_id, raster_path, metadata)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (rem_raster_id) DO NOTHING
+                    """,
+                    [
+                        record["rem_raster_id"],
+                        record["catchment_id"],
+                        record["hand_version_id"],
+                        record["raster_path"],
+                        record["metadata"],
+                    ],
+                )
+
+        # Batch insert catchment rasters
+        all_catchment_rasters = []
+        for data in batch_data:
+            if data and "catchment_rasters" in data:
+                all_catchment_rasters.extend(data["catchment_rasters"])
+
+        if all_catchment_rasters:
+            print(f"Batch inserting {len(all_catchment_rasters)} catchment rasters...")
+            for record in all_catchment_rasters:
+                conn.execute(
+                    """
+                    INSERT INTO HAND_Catchment_Rasters (catchment_raster_id, rem_raster_id, raster_path, metadata)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT (catchment_raster_id) DO NOTHING
+                    """,
+                    [
+                        record["catchment_raster_id"],
+                        record["rem_raster_id"],
+                        record["raster_path"],
+                        record["metadata"],
+                    ],
+                )
+
+        conn.execute("COMMIT;")
+        print(f"Successfully batch inserted data from {len(batch_data)} branches")
+
+    except Exception as e:
+        conn.execute("ROLLBACK;")
+        print(f"Error in batch insert: {e}")
+        raise
     finally:
-        return_connection(conn)
+        conn.close()
 
 
 def load_hand_suite(
@@ -320,11 +614,9 @@ def load_hand_suite(
     hand_dir: str,
     hand_ver: str,
     nwm_ver: Decimal,
+    batch_size: int = 100,
 ):
-    """Load HAND data suite into DuckDB."""
-    # Initialize connection pool
-    initialize_connection_pool(db_path, pool_size=8)
-
+    """Load HAND data suite into DuckDB with batch processing."""
     # Find all branch dirs
     branch_dirs = list_branch_dirs(hand_dir)
     if not branch_dirs:
@@ -333,14 +625,40 @@ def load_hand_suite(
 
     print(f"Found {len(branch_dirs)} branch directories to process")
 
-    # Process in parallel
+    # Process in parallel batches
     args_list = [(d, hand_ver, str(nwm_ver)) for d in branch_dirs]
+    all_results = []
+    successful_count = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        results = list(executor.map(process_branch, args_list))
+    print(f"Processing branches in batches of {batch_size}...")
 
-    successful = sum(results)
-    print(f"Successfully processed {successful}/{len(branch_dirs)} branches")
+    for i in range(0, len(args_list), batch_size):
+        batch_args = args_list[i : i + batch_size]
+        print(
+            f"Processing batch {i//batch_size + 1}/{(len(args_list) + batch_size - 1)//batch_size} ({len(batch_args)} branches)"
+        )
+
+        # Process batch in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            batch_results = list(executor.map(process_branch, batch_args))
+
+        # Filter out None results and collect valid data
+        valid_results = [r for r in batch_results if r is not None]
+        successful_count += len(valid_results)
+
+        # Batch insert the collected data
+        if valid_results:
+            try:
+                batch_insert_data(db_path, valid_results)
+                print(
+                    f"  Batch {i//batch_size + 1}: Successfully inserted {len(valid_results)} branches"
+                )
+            except Exception as e:
+                print(f"  Batch {i//batch_size + 1}: Failed to insert batch: {e}")
+        else:
+            print(f"  Batch {i//batch_size + 1}: No valid data to insert")
+
+    print(f"Successfully processed {successful_count}/{len(branch_dirs)} branches")
 
 
 def partition_tables_to_parquet(db_path: str, output_dir: str, h3_resolution: int = 1):
@@ -556,6 +874,12 @@ def main():
             default=1,
             help="H3 resolution for spatial partitioning (default: 1)",
         )
+        p.add_argument(
+            "--batch-size",
+            type=int,
+            default=100,
+            help="Number of branches to process in each batch (default: 100)",
+        )
         args = p.parse_args()
 
         # Check if database exists for skip-load option
@@ -575,7 +899,9 @@ def main():
                     f"Warning: --skip-load specified but database {args.db_path} does not exist. Loading data..."
                 )
 
-            load_hand_suite(args.db_path, args.hand_dir, hand_ver, nwm_ver)
+            load_hand_suite(
+                args.db_path, args.hand_dir, hand_ver, nwm_ver, args.batch_size
+            )
             print(f"\nData loaded into {args.db_path}")
         else:
             print(f"Skipping data load, using existing database: {args.db_path}")
