@@ -211,14 +211,16 @@ def create_interactive_map(
     if all_catchments is not None:
         logger.info(f"Adding {len(all_catchments)} background catchments...")
         all_catchments_4326 = all_catchments.to_crs(epsg=4326)
-        
+
         # Simplify geometries for performance
-        all_catchments_4326['geometry'] = all_catchments_4326['geometry'].simplify(0.001)
-        
+        all_catchments_4326["geometry"] = all_catchments_4326["geometry"].simplify(
+            0.001
+        )
+
         for idx, row in all_catchments_4326.iterrows():
             geom = row.geometry
             catchment_id = row.catchment_id
-            
+
             # Skip invalid geometries
             if geom is None or geom.is_empty:
                 continue
@@ -238,7 +240,9 @@ def create_interactive_map(
                     tooltip=f"Background catchment {catchment_id}",
                 ).add_to(m)
             except Exception as e:
-                logger.warning(f"Could not add background catchment {catchment_id}: {e}")
+                logger.warning(
+                    f"Could not add background catchment {catchment_id}: {e}"
+                )
                 continue
 
     # Add ROI polygon
@@ -258,15 +262,19 @@ def create_interactive_map(
     # Reproject intersecting catchments to 4326 for mapping
     logger.info(f"Adding {len(intersecting_catchments)} intersecting catchments...")
     intersecting_4326 = intersecting_catchments.to_crs(epsg=4326)
-    
+
     # Simplify geometries for performance
-    intersecting_4326['geometry'] = intersecting_4326['geometry'].simplify(0.001)
+    intersecting_4326["geometry"] = intersecting_4326["geometry"].simplify(0.001)
 
     # Get query result catchment IDs (ensure they're strings for comparison)
     query_catchment_ids = set()
     if query_results is not None:
-        query_catchment_ids = set(str(cid) for cid in query_results["catchment_id"].unique())
-        logger.info(f"Found {len(query_catchment_ids)} unique catchments in query results")
+        query_catchment_ids = set(
+            str(cid) for cid in query_results["catchment_id"].unique()
+        )
+        logger.info(
+            f"Found {len(query_catchment_ids)} unique catchments in query results"
+        )
         logger.info(f"Sample query result IDs: {list(query_catchment_ids)[:3]}")
     else:
         logger.info("No query results provided")
@@ -276,7 +284,7 @@ def create_interactive_map(
     for idx, row in intersecting_4326.iterrows():
         geom = row.geometry
         catchment_id = row.catchment_id
-        
+
         # Skip invalid geometries
         if geom is None or geom.is_empty:
             continue
@@ -295,11 +303,13 @@ def create_interactive_map(
         ]
 
         # Build tooltip content (plain text - short)
-        tooltip_lines = [f"Catchment: {catchment_id_str[-8:]}"]  # Show last 8 chars of ID
-        
+        tooltip_lines = [
+            f"Catchment: {catchment_id_str[-8:]}"
+        ]  # Show last 8 chars of ID
+
         # Build popup content (proper HTML with DOCTYPE and full structure)
         if is_in_results:
-            popup_html = f'''<!DOCTYPE html>
+            popup_html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -318,10 +328,10 @@ def create_interactive_map(
 <body>
     <div class="header">✓ Query Result</div>
     <div class="info"><span class="label">Catchment ID:</span><br><span class="catchment-id">{catchment_id_str}</span></div>
-'''
+"""
             tooltip_lines.insert(0, "✓ Query Result")
         else:
-            popup_html = f'''<!DOCTYPE html>
+            popup_html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -340,7 +350,7 @@ def create_interactive_map(
 <body>
     <div class="header">• Intersecting Catchment</div>
     <div class="info"><span class="label">Catchment ID:</span><br><span class="catchment-id">{catchment_id_str}</span></div>
-'''
+"""
             tooltip_lines.insert(0, "• Intersecting")
 
         if not catchment_attrs.empty:
@@ -361,26 +371,26 @@ def create_interactive_map(
                 sample_hydros.append(f"{hydro_id}")
             if hydro_count > display_count:
                 popup_html += f'<li class="hydro-item" style="font-style: italic; color: #666;">... and {hydro_count - display_count} more</li>'
-            popup_html += '</ul>'
-            
+            popup_html += "</ul>"
+
             if sample_hydros:
                 tooltip_lines.append(f"HydroIDs: {', '.join(sample_hydros[:2])}")
 
             # Add raster info if available
             rem_path = catchment_attrs.iloc[0].get("rem_raster_path", "N/A")
             catch_path = catchment_attrs.iloc[0].get("catchment_raster_path", "N/A")
-            
+
             # Show full paths with wrapping
-            popup_html += f'''
+            popup_html += f"""
             <div class="separator"></div>
             <div class="info"><span class="label">REM Raster:</span><br><div class="raster-path">{rem_path}</div></div>
             <div class="info"><span class="label">Catchment Raster:</span><br><div class="raster-path">{catch_path}</div></div>
-            '''
+            """
         else:
             popup_html += '<div class="info" style="color: #999; font-style: italic;">No hydrotable data found</div>'
             tooltip_lines.append("No hydrotable data")
 
-        popup_html += '</body></html>'
+        popup_html += "</body></html>"
 
         # Style based on whether it's in query results
         if is_in_results:
@@ -397,7 +407,7 @@ def create_interactive_map(
                 "weight": 2,
                 "fillOpacity": 0.5,
             }
-        
+
         # Create plain text tooltip
         tooltip_text = " | ".join(tooltip_lines)
         popup_content = popup_html
@@ -406,7 +416,7 @@ def create_interactive_map(
             # Use IFrame approach for better HTML rendering
             iframe = branca.element.IFrame(html=popup_content, width=420, height=350)
             popup = folium.Popup(iframe, max_width=450)
-            
+
             folium.GeoJson(
                 geom.__geo_interface__,
                 style_function=lambda feature, style=style: style,
@@ -416,7 +426,7 @@ def create_interactive_map(
         except Exception as e:
             logger.warning(f"Could not add catchment {catchment_id}: {e}")
             continue
-    
+
     logger.info(f"Added {query_result_count} catchments as query results (green)")
 
     # Add legend
@@ -532,10 +542,12 @@ def main():
             args.geojson, args.partitioned_path
         )
         logger.info("Found %d total catchments in region", len(all_catchments))
-        
+
         # Limit number of background catchments for performance
         if len(all_catchments) > args.max_catchments:
-            logger.warning(f"Limiting to {args.max_catchments} catchments for performance")
+            logger.warning(
+                f"Limiting to {args.max_catchments} catchments for performance"
+            )
             all_catchments = all_catchments.head(args.max_catchments)
 
     # Create interactive map

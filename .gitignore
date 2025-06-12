@@ -3,4 +3,9 @@ test_data/
 .venv/
 *.ddb*
 *.html
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
 
