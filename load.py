@@ -627,7 +627,7 @@ def load_hand_suite(
     total_count = len(branch_dirs)
 
     # These are producers that will process branches in parallel
-    with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
         futures = [executor.submit(process_branch, args) for args in args_list]
 
         for future in concurrent.futures.as_completed(futures):
