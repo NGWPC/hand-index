@@ -109,10 +109,10 @@ def read_gpkg_fallback(path: str) -> gpd.GeoDataFrame:
 
 
 def aggregate_to_scalar_or_array(series):
-    """Return single value if all values are the same, otherwise return array of unique values.
+    """Return single value if all values are the same, otherwise return full array preserving order.
 
-    This compresses data while preserving information - avoids storing redundant arrays
-    when all stage/discharge values are identical across reaches.
+    This avoids storing redundant arrays when all stage/discharge values are identical,
+    but preserves the full array with duplicates when values differ (maintaining row correspondence).
     """
     clean_values = series.dropna()
     if clean_values.empty:
@@ -122,7 +122,7 @@ def aggregate_to_scalar_or_array(series):
     if len(unique_values) == 1:
         return unique_values[0]
     else:
-        return list(unique_values)
+        return list(clean_values)  # Return all values, not just unique
 
 
 def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
