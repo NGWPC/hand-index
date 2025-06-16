@@ -141,14 +141,13 @@ def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
         raise
 
 
-def process_catchment_files(filesystem, directory_path: str) -> Tuple[List, Optional[str]]:
+def process_catchment_files(filesystem, directory_path: str, protocol: str) -> Tuple[List, Optional[str]]:
     """Process all catchment files in a directory and return geometries and CRS."""
     catchment_files = filesystem.glob(f"{directory_path}/*gw_catchments*.gpkg")
     geometries = []
     catchment_crs = None
 
     for catchment_file_path in catchment_files:
-        protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
         if protocol == "file":
             file_uri = catchment_file_path
         else:
@@ -173,7 +172,7 @@ def process_catchment_files(filesystem, directory_path: str) -> Tuple[List, Opti
 
 
 def process_hydrotable_files(
-    filesystem, directory_path: str, catchment_id: str, hand_version: str, nwm_version: str
+    filesystem, directory_path: str, catchment_id: str, hand_version: str, nwm_version: str, protocol: str
 ) -> List[Dict]:
     """Process all hydrotable CSV files in a directory and return hydrotable records."""
     hydrotable_files = filesystem.glob(f"{directory_path}/hydroTable_*.csv")
@@ -183,7 +182,6 @@ def process_hydrotable_files(
         return hydrotable_records
 
     csv_dataframes = []
-    protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
 
     for hydrotable_file_path in hydrotable_files:
         if protocol == "file":
@@ -202,30 +200,21 @@ def process_hydrotable_files(
         combined_csv_data = pd.concat(csv_dataframes, ignore_index=True)
         processed_hydrotables = process_hydrotable_data(combined_csv_data)
 
-        for _, hydrotable_row in processed_hydrotables.iterrows():
-            hydrotable_record = {
-                "catchment_id": catchment_id,
-                "hand_version_id": hand_version,
-                "nwm_version_id": nwm_version,
-                "HydroID": hydrotable_row["HydroID"],
-            }
+        # Add metadata columns using vectorized operations
+        processed_hydrotables["catchment_id"] = catchment_id
+        processed_hydrotables["hand_version_id"] = hand_version
+        processed_hydrotables["nwm_version_id"] = nwm_version
 
-            for column_name in processed_hydrotables.columns:
-                if column_name != "HydroID":
-                    hydrotable_record[column_name] = (
-                        hydrotable_row[column_name] if column_name in hydrotable_row.index else None
-                    )
-
-            hydrotable_records.append(hydrotable_record)
+        # Convert to records in one operation
+        hydrotable_records = processed_hydrotables.to_dict("records")
 
     return hydrotable_records
 
 
 def process_raster_files(
-    filesystem, directory_path: str, catchment_id: str, hand_version: str
+    filesystem, directory_path: str, catchment_id: str, hand_version: str, protocol: str
 ) -> Tuple[List[Dict], List[Dict]]:
     """Process REM and catchment raster files and return records for both."""
-    protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
     rem_raster_records = []
     catchment_raster_records = []
 
@@ -291,8 +280,11 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version: str) -> Opti
     try:
         filesystem, directory_path = fsspec.core.url_to_fs(branch_dir)
 
+        # Calculate protocol once for all operations
+        protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
+
         # Process catchment geometry files
-        geometries, catchment_crs = process_catchment_files(filesystem, directory_path)
+        geometries, catchment_crs = process_catchment_files(filesystem, directory_path, protocol)
         if not geometries:
             print(f"  No catchment geometries found in {branch_dir}")
             return None
@@ -313,14 +305,16 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version: str) -> Opti
                 "additional_attributes": None,
             },
             "hydrotables": process_hydrotable_files(
-                filesystem, directory_path, catchment_id, hand_version, nwm_version
+                filesystem, directory_path, catchment_id, hand_version, nwm_version, protocol
             ),
             "rem_rasters": [],
             "catchment_rasters": [],
         }
 
         # Process raster files
-        rem_rasters, catchment_rasters = process_raster_files(filesystem, directory_path, catchment_id, hand_version)
+        rem_rasters, catchment_rasters = process_raster_files(
+            filesystem, directory_path, catchment_id, hand_version, protocol
+        )
         result_data["rem_rasters"] = rem_rasters
         result_data["catchment_rasters"] = catchment_rasters
 
@@ -332,7 +326,7 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version: str) -> Opti
         return None
 
 
-def batch_insert_data(db_path: str, batch_data: List[Dict[str, Any]]):
+def batch_insert_data(db_path: str, batch_data: List[Dict[str, Any]], valid_hydrotable_columns: set):
     """
     Perform batch insertions into the database using efficient batch operations.
     """
@@ -369,26 +363,11 @@ def batch_insert_data(db_path: str, batch_data: List[Dict[str, Any]]):
             if all_hydrotable_records:
                 print(f"Batch inserting {len(all_hydrotable_records)} hydrotable records...")
 
-                # Define valid columns from schema
-                # catchment_id, hand_version_id, nwm_version_id are added by script, rest come from CSV
-                valid_columns = {
-                    "catchment_id",
-                    "hand_version_id",
-                    "HydroID",
-                    "nwm_version_id",
-                    "feature_id",
-                    "stage",
-                    "discharge_cms",
-                    "default_discharge_cms",
-                    "HUC",
-                    "LakeID",
-                }
-
                 # Get columns that exist in data and are valid in schema
                 all_columns = set()
                 for record in all_hydrotable_records:
                     all_columns.update(record.keys())
-                filtered_columns = sorted([col for col in all_columns if col in valid_columns])
+                filtered_columns = sorted([col for col in all_columns if col in valid_hydrotable_columns])
 
                 # Escape column names with double quotes to handle special characters
                 escaped_columns = [f'"{col}"' for col in filtered_columns]
@@ -461,6 +440,20 @@ def batch_writer(db_path: str, result_queue: queue.Queue, batch_size: int):
     Batch writer thread that accumulates results and inserts to database
     when batch size is reached or on shutdown.
     """
+    # Define valid columns once for all batches
+    valid_hydrotable_columns = {
+        "catchment_id",
+        "hand_version_id",
+        "HydroID",
+        "nwm_version_id",
+        "feature_id",
+        "stage",
+        "discharge_cms",
+        "default_discharge_cms",
+        "HUC",
+        "LakeID",
+    }
+
     batch = []
     while True:
         item = result_queue.get()
@@ -470,7 +463,7 @@ def batch_writer(db_path: str, result_queue: queue.Queue, batch_size: int):
         batch.append(item)
         if len(batch) >= batch_size:
             try:
-                batch_insert_data(db_path, batch)
+                batch_insert_data(db_path, batch, valid_hydrotable_columns)
             except Exception as e:
                 print(f"CRITICAL: Batch insert failed: {e}")
                 raise
@@ -478,7 +471,7 @@ def batch_writer(db_path: str, result_queue: queue.Queue, batch_size: int):
 
     if batch:
         try:
-            batch_insert_data(db_path, batch)
+            batch_insert_data(db_path, batch, valid_hydrotable_columns)
         except Exception as e:
             print(f"CRITICAL: Final batch insert failed: {e}")
             raise
