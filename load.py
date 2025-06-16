@@ -222,40 +222,46 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version_str: str) -> 
 
                     result_data["hydrotables"].append(hydrotable_record)
 
-        rem_tifs = fs.glob(f"{anon}/*rem_zeroed*.tif")
+        rem_tifs = filesystem.glob(f"{directory_path}/*rem_zeroed*.tif")
         rem_ids = []
         if rem_tifs:
             if len(rem_tifs) > 1:
-                print(f"WARNING: Multiple REM rasters found in {anon}")
+                print(f"WARNING: Multiple REM rasters found in {directory_path}")
 
             rem_tif = rem_tifs[0]
-            scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
-            uri = f"{scheme}://{rem_tif}" if scheme != "file" else rem_tif
-            parts = uri.split(f"{hand_ver}/", 1)
-            rel_uri = f"{hand_ver}/{parts[1]}" if len(parts) == 2 else uri
-            rid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{cid}:{Path(rel_uri)}")
+            protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
+            if protocol == "file":
+                uri = rem_tif
+            else:
+                uri = f"{protocol}://{rem_tif}"
+            parts = uri.split(f"{hand_version}/", 1)
+            rel_uri = f"{hand_version}/{parts[1]}" if len(parts) == 2 else uri
+            rid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{catchment_id}:{Path(rel_uri)}")
             rem_ids.append(rid)
 
             result_data["rem_rasters"].append(
                 {
                     "rem_raster_id": str(rid),
-                    "catchment_id": str(cid),
-                    "hand_version_id": hand_ver,
+                    "catchment_id": str(catchment_id),
+                    "hand_version_id": hand_version,
                     "raster_path": uri,
                     "metadata": None,
                 }
             )
 
-        catch_tifs = fs.glob(f"{anon}/*gw_catchments_reaches*.tif")
+        catch_tifs = filesystem.glob(f"{directory_path}/*gw_catchments_reaches*.tif")
         if catch_tifs and rem_ids:
             if len(catch_tifs) > 1:
-                print(f"WARNING: Multiple catchment rasters found in {anon}")
+                print(f"WARNING: Multiple catchment rasters found in {directory_path}")
 
             catch_tif = catch_tifs[0]
-            scheme = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
-            uri = f"{scheme}://{catch_tif}" if scheme != "file" else catch_tif
-            parts = uri.split(f"{hand_ver}/", 1)
-            rel_uri = f"{hand_ver}/{parts[1]}" if len(parts) == 2 else uri
+            protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
+            if protocol == "file":
+                uri = catch_tif
+            else:
+                uri = f"{protocol}://{catch_tif}"
+            parts = uri.split(f"{hand_version}/", 1)
+            rel_uri = f"{hand_version}/{parts[1]}" if len(parts) == 2 else uri
             crid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{rem_ids[0]}:{Path(rel_uri)}")
 
             result_data["catchment_rasters"].append(
@@ -267,11 +273,11 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version_str: str) -> 
                 }
             )
 
-        print(f"  Successfully processed branch: {d}")
+        print(f"  Successfully processed branch: {branch_dir}")
         return result_data
 
     except Exception as e:
-        print(f"  ERROR processing branch {d}: {e}")
+        print(f"  ERROR processing branch {branch_dir}: {e}")
         return None
 
 
