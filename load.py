@@ -99,32 +99,6 @@ def list_branch_dirs(hand_dir: str) -> List[str]:
     return branch_directories
 
 
-def read_gpkg_fallback(path: str) -> gpd.GeoDataFrame:
-    """Read GPKG with fallback to Fiona."""
-    try:
-        return gpd.read_file(path)
-    except DataSourceError:
-        with fiona.open(path, driver="GPKG") as src:
-            return gpd.GeoDataFrame.from_features(src, crs=src.crs)
-
-
-def aggregate_to_scalar_or_array(series):
-    """Return single value if all values are the same, otherwise return full array preserving order.
-
-    This avoids storing redundant arrays when all stage/discharge values are identical,
-    but preserves the full array with duplicates when values differ (maintaining row correspondence).
-    """
-    clean_values = series.dropna()
-    if clean_values.empty:
-        return None
-
-    unique_values = clean_values.unique()
-    if len(unique_values) == 1:
-        return unique_values[0]
-    else:
-        return list(clean_values)  # Return all values, not just unique
-
-
 def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Process hydrotable dataframe by grouping by HydroID and converting multi-valued columns to arrays.
@@ -143,10 +117,17 @@ def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
             except (ValueError, TypeError):
                 pass
 
+    # Define which columns should be arrays based on schema
+    array_columns = {"stage", "discharge_cms", "default_discharge_cms"}
+
     agg_dict = {}
     for col in df.columns:
         if col != "HydroID":
-            agg_dict[col] = aggregate_to_scalar_or_array
+            if col in array_columns:
+                agg_dict[col] = lambda x: list(x.dropna()) if not x.dropna().empty else None
+            else:
+                # For scalar columns, take first non-null value or None if all null
+                agg_dict[col] = lambda x: x.dropna().iloc[0] if not x.dropna().empty else None
 
     df = df.sort_values(["HydroID"])
     try:
@@ -174,7 +155,13 @@ def process_catchment_files(filesystem, directory_path: str) -> Tuple[List, Opti
 
         with fetch_local(file_uri) as local_file:
             try:
-                geodataframe = read_gpkg_fallback(local_file)
+                try:
+                    geodataframe = gpd.read_file(local_file)
+                # load with fiona if pyriogio fails
+                except DataSourceError:
+                    with fiona.open(local_file, driver="GPKG") as src:
+                        geodataframe = gpd.GeoDataFrame.from_features(src, crs=src.crs)
+
                 if not geodataframe.empty:
                     catchment_crs = catchment_crs or geodataframe.crs.to_string()
                     geometries.append(unary_union(geodataframe.geometry))
@@ -184,7 +171,9 @@ def process_catchment_files(filesystem, directory_path: str) -> Tuple[List, Opti
     return geometries, catchment_crs
 
 
-def process_hydrotable_files(filesystem, directory_path: str, catchment_id: str, hand_version: str) -> List[Dict]:
+def process_hydrotable_files(
+    filesystem, directory_path: str, catchment_id: str, hand_version: str, nwm_version: str
+) -> List[Dict]:
     """Process all hydrotable CSV files in a directory and return hydrotable records."""
     hydrotable_files = filesystem.glob(f"{directory_path}/hydroTable_*.csv")
     hydrotable_records = []
@@ -216,6 +205,7 @@ def process_hydrotable_files(filesystem, directory_path: str, catchment_id: str,
             hydrotable_record = {
                 "catchment_id": catchment_id,
                 "hand_version_id": hand_version,
+                "nwm_version_id": nwm_version,
                 "HydroID": hydrotable_row["HydroID"],
             }
 
@@ -321,7 +311,9 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version: str) -> Opti
                 "geometry_wkt": merged_geometry.wkt,
                 "additional_attributes": None,
             },
-            "hydrotables": process_hydrotable_files(filesystem, directory_path, catchment_id, hand_version),
+            "hydrotables": process_hydrotable_files(
+                filesystem, directory_path, catchment_id, hand_version, nwm_version
+            ),
             "rem_rasters": [],
             "catchment_rasters": [],
         }
@@ -356,7 +348,7 @@ def batch_insert_data(db_path: str, batch_data: List[Dict[str, Any]]):
                 conn.executemany(
                     """
                     INSERT INTO Catchments (catchment_id, hand_version_id, geometry, additional_attributes)
-                    VALUES (?, ?, ST_GeomFromText(?), ?)
+                    VALUES (?, ?, ?::GEOMETRY, ?)
                     ON CONFLICT (catchment_id) DO NOTHING
                     """,
                     [
@@ -375,18 +367,38 @@ def batch_insert_data(db_path: str, batch_data: List[Dict[str, Any]]):
             ]
             if all_hydrotable_records:
                 print(f"Batch inserting {len(all_hydrotable_records)} hydrotable records...")
+
+                # Define valid columns from schema
+                # catchment_id, hand_version_id, nwm_version_id are added by script, rest come from CSV
+                valid_columns = {
+                    "catchment_id",
+                    "hand_version_id",
+                    "HydroID",
+                    "nwm_version_id",
+                    "feature_id",
+                    "stage",
+                    "discharge_cms",
+                    "default_discharge_cms",
+                    "HUC",
+                    "LakeID",
+                }
+
+                # Get columns that exist in data and are valid in schema
                 all_columns = set()
                 for record in all_hydrotable_records:
                     all_columns.update(record.keys())
-                all_columns = sorted(list(all_columns))
+                filtered_columns = sorted([col for col in all_columns if col in valid_columns])
+
+                # Escape column names with double quotes to handle special characters
+                escaped_columns = [f'"{col}"' for col in filtered_columns]
 
                 conn.executemany(
                     f"""
-                    INSERT INTO Hydrotables ({', '.join(all_columns)})
-                    VALUES ({', '.join(['?']*len(all_columns))})
+                    INSERT INTO Hydrotables ({', '.join(escaped_columns)})
+                    VALUES ({', '.join(['?']*len(filtered_columns))})
                     ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING
                     """,
-                    [tuple(rec.get(col) for col in all_columns) for rec in all_hydrotable_records],
+                    [tuple(rec.get(col) for col in filtered_columns) for rec in all_hydrotable_records],
                 )
 
             all_rem_rasters = [
