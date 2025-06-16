@@ -131,7 +131,6 @@ def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
                 # For scalar columns, take first non-null value or None if all null
                 agg_dict[col] = lambda x: x.dropna().iloc[0] if not x.dropna().empty else None
 
-    df = df.sort_values(["HydroID"])
     try:
         grp = df.groupby("HydroID").agg(agg_dict).reset_index()
         return grp
