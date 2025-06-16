@@ -110,15 +110,17 @@ def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
 
     df["HydroID"] = df["HydroID"].astype(str)
 
+    # Define column types based on schema
+    numeric_columns = {"nwm_version_id", "feature_id", "stage", "discharge_cms", "default_discharge_cms"}
+    array_columns = {"stage", "discharge_cms", "default_discharge_cms"}
+
+    # Only convert numeric columns to numeric, leave text columns as-is
     for col in df.columns:
-        if col != "HydroID":
+        if col != "HydroID" and col in numeric_columns:
             try:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
             except (ValueError, TypeError):
                 pass
-
-    # Define which columns should be arrays based on schema
-    array_columns = {"stage", "discharge_cms", "default_discharge_cms"}
 
     agg_dict = {}
     for col in df.columns:
