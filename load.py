@@ -21,6 +21,20 @@ from pyogrio.errors import DataSourceError
 from shapely.ops import unary_union
 
 SENTINEL = object()  # Use unique object to avoid accidental queue shutdown
+UUID_NAMESPACE = py_uuid.NAMESPACE_DNS  # Cache UUID namespace for performance
+
+
+# small helper aggregation functions defined for performance
+def to_array_agg(series):
+    """Convert series to array, handling nulls efficiently."""
+    non_null = series.dropna()
+    return list(non_null) if len(non_null) > 0 else None
+
+
+def to_scalar_agg(series):
+    """Get first non-null value efficiently."""
+    non_null = series.dropna()
+    return non_null.iloc[0] if len(non_null) > 0 else None
 
 
 @contextlib.contextmanager
@@ -115,21 +129,18 @@ def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
     array_columns = {"stage", "discharge_cms", "default_discharge_cms"}
 
     # Only convert numeric columns to numeric, leave text columns as-is
-    for col in df.columns:
-        if col != "HydroID" and col in numeric_columns:
-            try:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            except (ValueError, TypeError):
-                pass
+    numeric_cols_to_convert = [col for col in df.columns if col != "HydroID" and col in numeric_columns]
+    if numeric_cols_to_convert:
+        df[numeric_cols_to_convert] = df[numeric_cols_to_convert].apply(pd.to_numeric, errors="coerce")
 
     agg_dict = {}
     for col in df.columns:
         if col != "HydroID":
             if col in array_columns:
-                agg_dict[col] = lambda x: list(x.dropna()) if not x.dropna().empty else None
+                agg_dict[col] = to_array_agg
             else:
                 # For scalar columns, take first non-null value or None if all null
-                agg_dict[col] = lambda x: x.dropna().iloc[0] if not x.dropna().empty else None
+                agg_dict[col] = to_scalar_agg
 
     try:
         grp = df.groupby("HydroID").agg(agg_dict).reset_index()
@@ -233,7 +244,7 @@ def process_raster_files(
             uri = f"{protocol}://{rem_tif}"
         parts = uri.split(f"{hand_version}/", 1)
         rel_uri = f"{hand_version}/{parts[1]}" if len(parts) == 2 else uri
-        rid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{catchment_id}:{Path(rel_uri)}")
+        rid = py_uuid.uuid5(UUID_NAMESPACE, f"{catchment_id}:{rel_uri}")
         rem_ids.append(rid)
 
         rem_raster_records.append(
@@ -259,7 +270,7 @@ def process_raster_files(
             uri = f"{protocol}://{catch_tif}"
         parts = uri.split(f"{hand_version}/", 1)
         rel_uri = f"{hand_version}/{parts[1]}" if len(parts) == 2 else uri
-        crid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{rem_ids[0]}:{Path(rel_uri)}")
+        crid = py_uuid.uuid5(UUID_NAMESPACE, f"{rem_ids[0]}:{rel_uri}")
 
         catchment_raster_records.append(
             {
@@ -294,7 +305,7 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version: str) -> Opti
         path_parts = branch_dir.split(f"{hand_version}/", 1)
         relative_path = f"{hand_version}/{path_parts[1]}" if len(path_parts) == 2 else branch_dir
         # Use UUID5 to ensure identical geometries at the same HAND output path relative path always get same ID across runs
-        catchment_id = str(py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{Path(relative_path)}:{merged_geometry.wkt}"))
+        catchment_id = str(py_uuid.uuid5(UUID_NAMESPACE, f"{relative_path}:{merged_geometry.wkt}"))
 
         # Build result data structure
         result_data = {
@@ -364,10 +375,18 @@ def batch_insert_data(db_path: str, batch_data: List[Dict[str, Any]], valid_hydr
                 print(f"Batch inserting {len(all_hydrotable_records)} hydrotable records...")
 
                 # Get columns that exist in data and are valid in schema
-                all_columns = set()
-                for record in all_hydrotable_records:
-                    all_columns.update(record.keys())
-                filtered_columns = sorted([col for col in all_columns if col in valid_hydrotable_columns])
+                # Fast path: check if all records have same columns (common case)
+                first_record_columns = set(all_hydrotable_records[0].keys())
+                if len(all_hydrotable_records) == 1 or all(
+                    set(record.keys()) == first_record_columns for record in all_hydrotable_records[1:3]
+                ):
+                    filtered_columns = sorted(first_record_columns & valid_hydrotable_columns)
+                else:
+                    # Slow path: records have different columns
+                    all_columns = set()
+                    for record in all_hydrotable_records:
+                        all_columns.update(record.keys())
+                    filtered_columns = sorted(all_columns & valid_hydrotable_columns)
 
                 # Escape column names with double quotes to handle special characters
                 escaped_columns = [f'"{col}"' for col in filtered_columns]
