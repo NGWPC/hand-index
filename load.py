@@ -20,7 +20,7 @@ import pandas as pd
 from pyogrio.errors import DataSourceError
 from shapely.ops import unary_union
 
-SENTINEL = object()  # Shutdown signal for batch writer thread
+SENTINEL = object()  # Use unique object to avoid accidental queue shutdown
 
 
 def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -42,7 +42,11 @@ def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
                 pass
 
     def aggregate_to_scalar_or_array(series):
-        """Return single value if all values are the same, otherwise return array of unique values."""
+        """Return single value if all values are the same, otherwise return array of unique values.
+
+        This compresses data while preserving information - avoids storing redundant arrays
+        when all stage/discharge values are identical across reaches.
+        """
         clean_values = series.dropna()
         if clean_values.empty:
             return None
@@ -69,28 +73,41 @@ def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
         raise
 
 
+@contextlib.contextmanager
+def get_database_connection(db_path: str):
+    """Context manager for DuckDB connections with spatial extension."""
+    conn = duckdb.connect(db_path)
+    try:
+        # Load spatial extension
+        try:
+            conn.execute("INSTALL spatial; LOAD spatial;")
+        except Exception:
+            pass  # Extension may already be loaded
+        yield conn
+    finally:
+        conn.close()
+
+
 def initialize_database(db_path: str, schema_path: str):
     """Initialize the DuckDB database with schema."""
-    conn = duckdb.connect(db_path)
+    with get_database_connection(db_path) as conn:
+        with open(schema_path, "r") as f:
+            schema_sql = f.read()
 
-    with open(schema_path, "r") as f:
-        schema_sql = f.read()
+        statements = [stmt.strip() for stmt in schema_sql.split(";") if stmt.strip()]
+        for stmt in statements:
+            if stmt:
+                try:
+                    conn.execute(stmt)
+                except Exception as e:
+                    print(f"Warning: Failed to execute statement: {stmt[:50]}... Error: {e}")
 
-    statements = [stmt.strip() for stmt in schema_sql.split(";") if stmt.strip()]
-    for stmt in statements:
-        if stmt:
-            try:
-                conn.execute(stmt)
-            except Exception as e:
-                print(f"Warning: Failed to execute statement: {stmt[:50]}... Error: {e}")
-
-    conn.close()
     print(f"Database initialized at: {db_path}")
 
 
 @contextlib.contextmanager
 def fetch_local(path: str):
-    """Download S3 files to local temp directory with context manager."""
+    """Download S3 files to local temp directory - required because some libraries need local file access."""
     low = path.lower()
     if not low.startswith(("s3://", "s3a://")):
         yield path
@@ -112,15 +129,15 @@ def list_branch_dirs(hand_dir: str) -> List[str]:
     filesystem, root_path = fsspec.core.url_to_fs(hand_dir)
     protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
     branch_directories = []
-    
+
     for directory_info in filesystem.ls(root_path, detail=True):
         if directory_info["type"] != "directory":
             continue
-            
+
         branches_path = f"{directory_info['name']}/branches"
         if not filesystem.exists(branches_path):
             continue
-            
+
         for branch_info in filesystem.ls(branches_path, detail=True):
             if branch_info["type"] == "directory":
                 if protocol == "file":
@@ -128,7 +145,7 @@ def list_branch_dirs(hand_dir: str) -> List[str]:
                 else:
                     full_path = f"{protocol}://{branch_info['name']}"
                 branch_directories.append(full_path)
-                
+
     return branch_directories
 
 
@@ -141,137 +158,177 @@ def read_gpkg_fallback(path: str) -> gpd.GeoDataFrame:
             return gpd.GeoDataFrame.from_features(src, crs=src.crs)
 
 
-def process_branch(branch_dir: str, hand_version: str, nwm_version_str: str) -> Optional[Dict[str, Any]]:
+def process_catchment_files(filesystem, directory_path: str) -> Tuple[List, Optional[str]]:
+    """Process all catchment files in a directory and return geometries and CRS."""
+    catchment_files = filesystem.glob(f"{directory_path}/*gw_catchments*.gpkg")
+    geometries = []
+    catchment_crs = None
+
+    for catchment_file_path in catchment_files:
+        protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
+        if protocol == "file":
+            file_uri = catchment_file_path
+        else:
+            file_uri = f"{protocol}://{catchment_file_path}"
+
+        with fetch_local(file_uri) as local_file:
+            try:
+                geodataframe = read_gpkg_fallback(local_file)
+                if not geodataframe.empty:
+                    catchment_crs = catchment_crs or geodataframe.crs.to_string()
+                    geometries.append(unary_union(geodataframe.geometry))
+            except Exception as e:
+                print(f"  ERROR: could not open {local_file!r} as GPKG: {e}")
+
+    return geometries, catchment_crs
+
+
+def process_hydrotable_files(filesystem, directory_path: str, catchment_id: str, hand_version: str) -> List[Dict]:
+    """Process all hydrotable CSV files in a directory and return hydrotable records."""
+    hydrotable_files = filesystem.glob(f"{directory_path}/hydroTable_*.csv")
+    hydrotable_records = []
+
+    if not hydrotable_files:
+        return hydrotable_records
+
+    csv_dataframes = []
+    protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
+
+    for hydrotable_file_path in hydrotable_files:
+        if protocol == "file":
+            file_uri = hydrotable_file_path
+        else:
+            file_uri = f"{protocol}://{hydrotable_file_path}"
+
+        with fetch_local(file_uri) as local_file:
+            try:
+                csv_data = pd.read_csv(local_file)
+                csv_dataframes.append(csv_data)
+            except Exception as e:
+                print(f"  couldn't read CSV: {local_file} because of {e}")
+
+    if csv_dataframes:
+        combined_csv_data = pd.concat(csv_dataframes, ignore_index=True)
+        processed_hydrotables = process_hydrotable_data(combined_csv_data)
+
+        for _, hydrotable_row in processed_hydrotables.iterrows():
+            hydrotable_record = {
+                "catchment_id": catchment_id,
+                "hand_version_id": hand_version,
+                "HydroID": hydrotable_row["HydroID"],
+            }
+
+            for column_name in processed_hydrotables.columns:
+                if column_name != "HydroID":
+                    hydrotable_record[column_name] = (
+                        hydrotable_row[column_name] if column_name in hydrotable_row.index else None
+                    )
+
+            hydrotable_records.append(hydrotable_record)
+
+    return hydrotable_records
+
+
+def process_raster_files(
+    filesystem, directory_path: str, catchment_id: str, hand_version: str
+) -> Tuple[List[Dict], List[Dict]]:
+    """Process REM and catchment raster files and return records for both."""
+    protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
+    rem_raster_records = []
+    catchment_raster_records = []
+
+    # Process REM rasters
+    rem_tifs = filesystem.glob(f"{directory_path}/*rem_zeroed*.tif")
+    rem_ids = []
+
+    if rem_tifs:
+        if len(rem_tifs) > 1:
+            print(f"WARNING: Multiple REM rasters found in {directory_path}")
+
+        rem_tif = rem_tifs[0]
+        if protocol == "file":
+            uri = rem_tif
+        else:
+            uri = f"{protocol}://{rem_tif}"
+        parts = uri.split(f"{hand_version}/", 1)
+        rel_uri = f"{hand_version}/{parts[1]}" if len(parts) == 2 else uri
+        rid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{catchment_id}:{Path(rel_uri)}")
+        rem_ids.append(rid)
+
+        rem_raster_records.append(
+            {
+                "rem_raster_id": str(rid),
+                "catchment_id": catchment_id,
+                "hand_version_id": hand_version,
+                "raster_path": uri,
+                "metadata": None,
+            }
+        )
+
+    # Process catchment rasters (only if we have REM rasters)
+    catch_tifs = filesystem.glob(f"{directory_path}/*gw_catchments_reaches*.tif")
+    if catch_tifs and rem_ids:
+        if len(catch_tifs) > 1:
+            print(f"WARNING: Multiple catchment rasters found in {directory_path}")
+
+        catch_tif = catch_tifs[0]
+        if protocol == "file":
+            uri = catch_tif
+        else:
+            uri = f"{protocol}://{catch_tif}"
+        parts = uri.split(f"{hand_version}/", 1)
+        rel_uri = f"{hand_version}/{parts[1]}" if len(parts) == 2 else uri
+        crid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{rem_ids[0]}:{Path(rel_uri)}")
+
+        catchment_raster_records.append(
+            {
+                "catchment_raster_id": str(crid),
+                "rem_raster_id": str(rem_ids[0]),
+                "raster_path": uri,
+                "metadata": None,
+            }
+        )
+
+    return rem_raster_records, catchment_raster_records
+
+
+def process_branch(branch_dir: str, hand_version: str, nwm_version: str) -> Optional[Dict[str, Any]]:
     """Process one branch directory and return data for batch insertion."""
     print(f"Processing branch: {branch_dir}")
-    nwm_version = Decimal(nwm_version_str)
 
     try:
         filesystem, directory_path = fsspec.core.url_to_fs(branch_dir)
-        catchment_files = filesystem.glob(f"{directory_path}/*gw_catchments*.gpkg")
-        geometries = []
-        catchment_crs = None
 
-        for catchment_file_path in catchment_files:
-            protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
-            if protocol == "file":
-                file_uri = catchment_file_path
-            else:
-                file_uri = f"{protocol}://{catchment_file_path}"
-                
-            with fetch_local(file_uri) as local_file:
-                try:
-                    geodataframe = read_gpkg_fallback(local_file)
-                    if not geodataframe.empty:
-                        catchment_crs = catchment_crs or geodataframe.crs.to_string()
-                        geometries.append(unary_union(geodataframe.geometry))
-                except Exception as e:
-                    print(f"  ERROR: could not open {local_file!r} as GPKG: {e}")
-
+        # Process catchment geometry files
+        geometries, catchment_crs = process_catchment_files(filesystem, directory_path)
         if not geometries:
             print(f"  No catchment geometries found in {branch_dir}")
             return None
 
+        # Create catchment ID from merged geometry
         merged_geometry = unary_union(geometries)
         path_parts = branch_dir.split(f"{hand_version}/", 1)
         relative_path = f"{hand_version}/{path_parts[1]}" if len(path_parts) == 2 else branch_dir
-        catchment_id = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{Path(relative_path)}:{merged_geometry.wkt}")
+        # Use UUID5 to ensure identical geometries at the same HAND output path relative path always get same ID across runs
+        catchment_id = str(py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{Path(relative_path)}:{merged_geometry.wkt}"))
 
+        # Build result data structure
         result_data = {
             "catchment": {
-                "catchment_id": str(catchment_id),
+                "catchment_id": catchment_id,
                 "hand_version_id": hand_version,
                 "geometry_wkt": merged_geometry.wkt,
                 "additional_attributes": None,
             },
-            "hydrotables": [],
+            "hydrotables": process_hydrotable_files(filesystem, directory_path, catchment_id, hand_version),
             "rem_rasters": [],
             "catchment_rasters": [],
         }
 
-        hydrotable_files = filesystem.glob(f"{directory_path}/hydroTable_*.csv")
-        if hydrotable_files:
-            csv_dataframes = []
-            for hydrotable_file_path in hydrotable_files:
-                if protocol == "file":
-                    file_uri = hydrotable_file_path
-                else:
-                    file_uri = f"{protocol}://{hydrotable_file_path}"
-                    
-                with fetch_local(file_uri) as local_file:
-                    try:
-                        csv_data = pd.read_csv(local_file)
-                        csv_dataframes.append(csv_data)
-                    except Exception as e:
-                        print(f"  couldn't read CSV: {local_file} because of {e}")
-
-            if csv_dataframes:
-                combined_csv_data = pd.concat(csv_dataframes, ignore_index=True)
-                processed_hydrotables = process_hydrotable_data(combined_csv_data)
-
-                for _, hydrotable_row in processed_hydrotables.iterrows():
-                    hydrotable_record = {
-                        "catchment_id": str(catchment_id),
-                        "hand_version_id": hand_version,
-                        "HydroID": hydrotable_row["HydroID"],
-                    }
-
-                    for column_name in processed_hydrotables.columns:
-                        if column_name != "HydroID":
-                            hydrotable_record[column_name] = hydrotable_row[column_name] if column_name in hydrotable_row.index else None
-
-                    result_data["hydrotables"].append(hydrotable_record)
-
-        rem_tifs = filesystem.glob(f"{directory_path}/*rem_zeroed*.tif")
-        rem_ids = []
-        if rem_tifs:
-            if len(rem_tifs) > 1:
-                print(f"WARNING: Multiple REM rasters found in {directory_path}")
-
-            rem_tif = rem_tifs[0]
-            protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
-            if protocol == "file":
-                uri = rem_tif
-            else:
-                uri = f"{protocol}://{rem_tif}"
-            parts = uri.split(f"{hand_version}/", 1)
-            rel_uri = f"{hand_version}/{parts[1]}" if len(parts) == 2 else uri
-            rid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{catchment_id}:{Path(rel_uri)}")
-            rem_ids.append(rid)
-
-            result_data["rem_rasters"].append(
-                {
-                    "rem_raster_id": str(rid),
-                    "catchment_id": str(catchment_id),
-                    "hand_version_id": hand_version,
-                    "raster_path": uri,
-                    "metadata": None,
-                }
-            )
-
-        catch_tifs = filesystem.glob(f"{directory_path}/*gw_catchments_reaches*.tif")
-        if catch_tifs and rem_ids:
-            if len(catch_tifs) > 1:
-                print(f"WARNING: Multiple catchment rasters found in {directory_path}")
-
-            catch_tif = catch_tifs[0]
-            protocol = filesystem.protocol if isinstance(filesystem.protocol, str) else filesystem.protocol[0]
-            if protocol == "file":
-                uri = catch_tif
-            else:
-                uri = f"{protocol}://{catch_tif}"
-            parts = uri.split(f"{hand_version}/", 1)
-            rel_uri = f"{hand_version}/{parts[1]}" if len(parts) == 2 else uri
-            crid = py_uuid.uuid5(py_uuid.NAMESPACE_DNS, f"{rem_ids[0]}:{Path(rel_uri)}")
-
-            result_data["catchment_rasters"].append(
-                {
-                    "catchment_raster_id": str(crid),
-                    "rem_raster_id": str(rem_ids[0]),
-                    "raster_path": uri,
-                    "metadata": None,
-                }
-            )
+        # Process raster files
+        rem_rasters, catchment_rasters = process_raster_files(filesystem, directory_path, catchment_id, hand_version)
+        result_data["rem_rasters"] = rem_rasters
+        result_data["catchment_rasters"] = catchment_rasters
 
         print(f"  Successfully processed branch: {branch_dir}")
         return result_data
@@ -288,107 +345,101 @@ def batch_insert_data(db_path: str, batch_data: List[Dict[str, Any]]):
     if not batch_data:
         return
 
-    conn = duckdb.connect(db_path)
-
-    try:
+    with get_database_connection(db_path) as conn:
         try:
-            conn.execute("INSTALL spatial; LOAD spatial;")
-        except Exception:
-            pass
+            conn.execute("BEGIN TRANSACTION;")
 
-        conn.execute("BEGIN TRANSACTION;")
+            catchment_records = [data["catchment"] for data in batch_data if data and "catchment" in data]
+            if catchment_records:
+                print(f"Batch inserting {len(catchment_records)} catchments...")
+                conn.executemany(
+                    """
+                    INSERT INTO Catchments (catchment_id, hand_version_id, geometry, additional_attributes)
+                    VALUES (?, ?, ST_GeomFromText(?), ?)
+                    ON CONFLICT (catchment_id) DO NOTHING
+                    """,
+                    [
+                        (
+                            r["catchment_id"],
+                            r["hand_version_id"],
+                            r["geometry_wkt"],
+                            r["additional_attributes"],
+                        )
+                        for r in catchment_records
+                    ],
+                )
 
-        catchment_records = [data["catchment"] for data in batch_data if data and "catchment" in data]
-        if catchment_records:
-            print(f"Batch inserting {len(catchment_records)} catchments...")
-            conn.executemany(
-                """
-                INSERT INTO Catchments (catchment_id, hand_version_id, geometry, additional_attributes)
-                VALUES (?, ?, ST_GeomFromText(?), ?)
-                ON CONFLICT (catchment_id) DO NOTHING
-                """,
-                [
-                    (
-                        r["catchment_id"],
-                        r["hand_version_id"],
-                        r["geometry_wkt"],
-                        r["additional_attributes"],
-                    )
-                    for r in catchment_records
-                ],
-            )
+            all_hydrotable_records = [
+                ht for data in batch_data if data and "hydrotables" in data for ht in data["hydrotables"]
+            ]
+            if all_hydrotable_records:
+                print(f"Batch inserting {len(all_hydrotable_records)} hydrotable records...")
+                all_columns = set()
+                for record in all_hydrotable_records:
+                    all_columns.update(record.keys())
+                all_columns = sorted(list(all_columns))
 
-        all_hydrotable_records = [
-            ht for data in batch_data if data and "hydrotables" in data for ht in data["hydrotables"]
-        ]
-        if all_hydrotable_records:
-            print(f"Batch inserting {len(all_hydrotable_records)} hydrotable records...")
-            all_columns = set()
-            for record in all_hydrotable_records:
-                all_columns.update(record.keys())
-            all_columns = sorted(list(all_columns))
+                conn.executemany(
+                    f"""
+                    INSERT INTO Hydrotables ({', '.join(all_columns)})
+                    VALUES ({', '.join(['?']*len(all_columns))})
+                    ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING
+                    """,
+                    [tuple(rec.get(col) for col in all_columns) for rec in all_hydrotable_records],
+                )
 
-            conn.executemany(
-                f"""
-                INSERT INTO Hydrotables ({', '.join(all_columns)})
-                VALUES ({', '.join(['?']*len(all_columns))})
-                ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING
-                """,
-                [tuple(rec.get(col) for col in all_columns) for rec in all_hydrotable_records],
-            )
+            all_rem_rasters = [
+                rr for data in batch_data if data and "rem_rasters" in data for rr in data["rem_rasters"]
+            ]
+            if all_rem_rasters:
+                print(f"Batch inserting {len(all_rem_rasters)} REM rasters...")
+                conn.executemany(
+                    """
+                    INSERT INTO HAND_REM_Rasters (rem_raster_id, catchment_id, hand_version_id, raster_path, metadata)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (rem_raster_id) DO NOTHING
+                    """,
+                    [
+                        (
+                            r["rem_raster_id"],
+                            r["catchment_id"],
+                            r["hand_version_id"],
+                            r["raster_path"],
+                            r["metadata"],
+                        )
+                        for r in all_rem_rasters
+                    ],
+                )
 
-        all_rem_rasters = [rr for data in batch_data if data and "rem_rasters" in data for rr in data["rem_rasters"]]
-        if all_rem_rasters:
-            print(f"Batch inserting {len(all_rem_rasters)} REM rasters...")
-            conn.executemany(
-                """
-                INSERT INTO HAND_REM_Rasters (rem_raster_id, catchment_id, hand_version_id, raster_path, metadata)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT (rem_raster_id) DO NOTHING
-                """,
-                [
-                    (
-                        r["rem_raster_id"],
-                        r["catchment_id"],
-                        r["hand_version_id"],
-                        r["raster_path"],
-                        r["metadata"],
-                    )
-                    for r in all_rem_rasters
-                ],
-            )
+            all_catchment_rasters = [
+                cr for data in batch_data if data and "catchment_rasters" in data for cr in data["catchment_rasters"]
+            ]
+            if all_catchment_rasters:
+                print(f"Batch inserting {len(all_catchment_rasters)} catchment rasters...")
+                conn.executemany(
+                    """
+                    INSERT INTO HAND_Catchment_Rasters (catchment_raster_id, rem_raster_id, raster_path, metadata)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT (catchment_raster_id) DO NOTHING
+                    """,
+                    [
+                        (
+                            r["catchment_raster_id"],
+                            r["rem_raster_id"],
+                            r["raster_path"],
+                            r["metadata"],
+                        )
+                        for r in all_catchment_rasters
+                    ],
+                )
 
-        all_catchment_rasters = [
-            cr for data in batch_data if data and "catchment_rasters" in data for cr in data["catchment_rasters"]
-        ]
-        if all_catchment_rasters:
-            print(f"Batch inserting {len(all_catchment_rasters)} catchment rasters...")
-            conn.executemany(
-                """
-                INSERT INTO HAND_Catchment_Rasters (catchment_raster_id, rem_raster_id, raster_path, metadata)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT (catchment_raster_id) DO NOTHING
-                """,
-                [
-                    (
-                        r["catchment_raster_id"],
-                        r["rem_raster_id"],
-                        r["raster_path"],
-                        r["metadata"],
-                    )
-                    for r in all_catchment_rasters
-                ],
-            )
+            conn.execute("COMMIT;")
+            print(f"Successfully batch inserted data from {len(batch_data)} branches")
 
-        conn.execute("COMMIT;")
-        print(f"Successfully batch inserted data from {len(batch_data)} branches")
-
-    except Exception as e:
-        conn.execute("ROLLBACK;")
-        print(f"Error in batch insert: {e}")
-        raise
-    finally:
-        conn.close()
+        except Exception as e:
+            conn.execute("ROLLBACK;")
+            print(f"Error in batch insert: {e}")
+            raise
 
 
 def batch_writer(db_path: str, result_queue: queue.Queue, batch_size: int):
@@ -422,8 +473,8 @@ def batch_writer(db_path: str, result_queue: queue.Queue, batch_size: int):
 def load_hand_suite(
     db_path: str,
     hand_dir: str,
-    hand_ver: str,
-    nwm_ver: Decimal,
+    hand_version: str,
+    nwm_version: Decimal,
     batch_size: int = 200,
 ):
     """Load HAND data suite into DuckDB with batch processing."""
@@ -444,7 +495,9 @@ def load_hand_suite(
 
     # These are producers that will process branches in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-        futures = [executor.submit(process_branch, branch_dir, hand_ver, str(nwm_ver)) for branch_dir in branch_dirs]
+        futures = [
+            executor.submit(process_branch, branch_dir, hand_version, str(nwm_version)) for branch_dir in branch_dirs
+        ]
 
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -465,155 +518,154 @@ def load_hand_suite(
 
 def partition_tables_to_parquet(db_path: str, output_dir: str, h3_resolution: int = 1):
     """Partition tables from DuckDB to parquet files using H3 spatial indexing."""
-    conn = duckdb.connect(db_path)
-
-    print("Loading DuckDB extensions...")
-    try:
-        conn.execute("INSTALL httpfs;")
-        conn.execute("LOAD httpfs;")
-        conn.execute("INSTALL aws;")
-        conn.execute("LOAD aws;")
-        conn.execute("INSTALL spatial;")
-        conn.execute("LOAD spatial;")
-        conn.execute("INSTALL h3 FROM community;")
-        conn.execute("LOAD h3;")
-    except Exception as e:
-        print(f"Error loading extensions: {e}")
-        raise
-
-    if output_dir.startswith("s3://"):
-        print("Configuring AWS settings for S3 access...")
+    with get_database_connection(db_path) as conn:
+        print("Loading DuckDB extensions...")
         try:
-            conn.execute("SET s3_region='us-east-1';")  # Default region
-            # You may need to set these if not using default AWS credentials
-            # conn.execute("SET s3_access_key_id='your-access-key';")
-            # conn.execute("SET s3_secret_access_key='your-secret-key';")
+            conn.execute("INSTALL httpfs;")
+            conn.execute("LOAD httpfs;")
+            conn.execute("INSTALL aws;")
+            conn.execute("LOAD aws;")
+            conn.execute("INSTALL spatial;")
+            conn.execute("LOAD spatial;")
+            conn.execute("INSTALL h3 FROM community;")
+            conn.execute("LOAD h3;")
         except Exception as e:
-            print(f"Warning: Could not configure AWS settings: {e}")
-
-    if output_dir.startswith("s3://"):
-        print("Testing S3 connectivity...")
-        try:
-            conn.execute("SELECT 1;")
-        except Exception as e:
-            print(f"Error with S3 connectivity test: {e}")
-            print(
-                "Make sure your AWS credentials are configured (aws configure) and you have write access to the S3 bucket."
-            )
+            print(f"Error loading extensions: {e}")
             raise
 
-    try:
-        conn.execute(
+        if output_dir.startswith("s3://"):
+            print("Configuring AWS settings for S3 access...")
+            try:
+                conn.execute("SET s3_region='us-east-1';")  # Default region
+                # You may need to set these if not using default AWS credentials
+                # conn.execute("SET s3_access_key_id='your-access-key';")
+                # conn.execute("SET s3_secret_access_key='your-secret-key';")
+            except Exception as e:
+                print(f"Warning: Could not configure AWS settings: {e}")
+
+        if output_dir.startswith("s3://"):
+            print("Testing S3 connectivity...")
+            try:
+                conn.execute("SELECT 1;")
+            except Exception as e:
+                print(f"Error with S3 connectivity test: {e}")
+                print(
+                    "Make sure your AWS credentials are configured (aws configure) and you have write access to the S3 bucket."
+                )
+                raise
+
+        try:
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS catchments_geom_idx
+                  ON catchments
+                  USING RTREE (geometry);
             """
-            CREATE INDEX IF NOT EXISTS catchments_geom_idx
-              ON catchments
-              USING RTREE (geometry);
-        """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_hydro_catchment_id ON hydrotables (catchment_id);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_hrr_catchment_id ON hand_rem_rasters (catchment_id);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_hcr_rem_raster_id ON hand_catchment_rasters (rem_raster_id);")
-    except Exception as e:
-        print(f"Warning: Could not create indexes: {e}")
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_hydro_catchment_id ON hydrotables (catchment_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_hrr_catchment_id ON hand_rem_rasters (catchment_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_hcr_rem_raster_id ON hand_catchment_rasters (rem_raster_id);")
+        except Exception as e:
+            print(f"Warning: Could not create indexes: {e}")
 
-    conn.execute(f"SET VARIABLE h3_resolution = {h3_resolution};")
+        conn.execute(f"SET VARIABLE h3_resolution = {h3_resolution};")
 
-    if not output_dir.endswith("/"):
-        output_dir += "/"
+        if not output_dir.endswith("/"):
+            output_dir += "/"
 
-    print("Partitioning catchments table...")
-    conn.execute(
-        f"""
-        COPY (
-            SELECT
-                c.*,
-                -- Get centroid, transform to EPSG:4326, then get H3 cell at resolution {h3_resolution}
-                h3_latlng_to_cell(
-                    ST_Y(ST_Transform(ST_Centroid(c.geometry), 'EPSG:5070', 'EPSG:4326', true)), -- Latitude
-                    ST_X(ST_Transform(ST_Centroid(c.geometry), 'EPSG:5070', 'EPSG:4326', true)), -- Longitude
-                    getvariable('h3_resolution')
-                ) AS h3_partition_key
-            FROM catchments c
-        ) TO '{output_dir}catchments/'
-        WITH (FORMAT PARQUET, PARTITION_BY (h3_partition_key), OVERWRITE_OR_IGNORE 1);
-    """
-    )
-
-    print("Creating catchment H3 mapping...")
-    conn.execute(
-        f"""
-        CREATE TEMP TABLE catchment_h3_map AS
-        SELECT
-            catchment_id,
-            h3_latlng_to_cell(
-                ST_Y(ST_Transform(ST_Centroid(geometry), 'EPSG:5070', 'EPSG:4326', true)),
-                ST_X(ST_Transform(ST_Centroid(geometry), 'EPSG:5070', 'EPSG:4326', true)),
-                getvariable('h3_resolution')
-            ) AS h3_partition_key
-        FROM catchments;
-    """
-    )
-
-    print("Partitioning hydrotables...")
-    conn.execute(
-        f"""
-        COPY (
-            SELECT
-                ht.*,
-                chm.h3_partition_key
-            FROM hydrotables ht
-            JOIN catchment_h3_map chm ON ht.catchment_id = chm.catchment_id
-        ) TO '{output_dir}hydrotables/'
-        WITH (FORMAT PARQUET, PARTITION_BY (h3_partition_key), OVERWRITE_OR_IGNORE 1);
-    """
-    )
-
-    print("Exporting HAND REM rasters (unpartitioned)...")
-    conn.execute(
-        f"""
-        COPY hand_rem_rasters TO '{output_dir}hand_rem_rasters.parquet'
-        WITH (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1);
-    """
-    )
-
-    print("Exporting HAND catchment rasters (unpartitioned)...")
-    conn.execute(
-        f"""
-        COPY hand_catchment_rasters TO '{output_dir}hand_catchment_rasters.parquet'
-        WITH (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1);
-    """
-    )
-
-    print("Creating catchment H3 lookup table...")
-    conn.execute(
-        f"""
-        COPY (
-            WITH CatchmentCentroids AS (
-                -- First, get the H3 cell for the centroid of each catchment
+        # Partition by H3 cells to enable fast spatial queries - only scan relevant geographic regions
+        print("Partitioning catchments table...")
+        conn.execute(
+            f"""
+            COPY (
                 SELECT
-                    c.catchment_id,
+                    c.*,
+                    -- Get centroid, transform to EPSG:4326, then get H3 cell at resolution {h3_resolution}
                     h3_latlng_to_cell(
                         ST_Y(ST_Transform(ST_Centroid(c.geometry), 'EPSG:5070', 'EPSG:4326', true)), -- Latitude
                         ST_X(ST_Transform(ST_Centroid(c.geometry), 'EPSG:5070', 'EPSG:4326', true)), -- Longitude
                         getvariable('h3_resolution')
-                    ) as h3_centroid_cell
+                    ) AS h3_partition_key
                 FROM catchments c
-                WHERE c.geometry IS NOT NULL AND NOT ST_IsEmpty(c.geometry)
-            )
+            ) TO '{output_dir}catchments/'
+            WITH (FORMAT PARQUET, PARTITION_BY (h3_partition_key), OVERWRITE_OR_IGNORE 1);
+        """
+        )
+
+        print("Creating catchment H3 mapping...")
+        conn.execute(
+            f"""
+            CREATE TEMP TABLE catchment_h3_map AS
             SELECT
-                cc.catchment_id,
-                -- For each centroid cell, get the cell itself and all neighbors in a 1-cell radius (k=1)
-                unnest(h3_grid_disk(cc.h3_centroid_cell, 1)) AS h3_covering_cell_key
-            FROM
-                CatchmentCentroids cc
-        ) TO '{output_dir}catchment_h3_lookup.parquet'
-        WITH (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1);
-    """
-    )
+                catchment_id,
+                h3_latlng_to_cell(
+                    ST_Y(ST_Transform(ST_Centroid(geometry), 'EPSG:5070', 'EPSG:4326', true)),
+                    ST_X(ST_Transform(ST_Centroid(geometry), 'EPSG:5070', 'EPSG:4326', true)),
+                    getvariable('h3_resolution')
+                ) AS h3_partition_key
+            FROM catchments;
+        """
+        )
 
-    conn.execute("DROP TABLE IF EXISTS catchment_h3_map;")
+        print("Partitioning hydrotables...")
+        conn.execute(
+            f"""
+            COPY (
+                SELECT
+                    ht.*,
+                    chm.h3_partition_key
+                FROM hydrotables ht
+                JOIN catchment_h3_map chm ON ht.catchment_id = chm.catchment_id
+            ) TO '{output_dir}hydrotables/'
+            WITH (FORMAT PARQUET, PARTITION_BY (h3_partition_key), OVERWRITE_OR_IGNORE 1);
+        """
+        )
 
-    conn.close()
+        print("Exporting HAND REM rasters (unpartitioned)...")
+        conn.execute(
+            f"""
+            COPY hand_rem_rasters TO '{output_dir}hand_rem_rasters.parquet'
+            WITH (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1);
+        """
+        )
+
+        print("Exporting HAND catchment rasters (unpartitioned)...")
+        conn.execute(
+            f"""
+            COPY hand_catchment_rasters TO '{output_dir}hand_catchment_rasters.parquet'
+            WITH (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1);
+        """
+        )
+
+        print("Creating catchment H3 lookup table...")
+        conn.execute(
+            f"""
+            COPY (
+                WITH CatchmentCentroids AS (
+                    -- First, get the H3 cell for the centroid of each catchment
+                    SELECT
+                        c.catchment_id,
+                        h3_latlng_to_cell(
+                            ST_Y(ST_Transform(ST_Centroid(c.geometry), 'EPSG:5070', 'EPSG:4326', true)), -- Latitude
+                            ST_X(ST_Transform(ST_Centroid(c.geometry), 'EPSG:5070', 'EPSG:4326', true)), -- Longitude
+                            getvariable('h3_resolution')
+                        ) as h3_centroid_cell
+                    FROM catchments c
+                    WHERE c.geometry IS NOT NULL AND NOT ST_IsEmpty(c.geometry)
+                )
+                SELECT
+                    cc.catchment_id,
+                    -- For each centroid cell, get the cell itself and all neighbors in a 1-cell radius (k=1)
+                    unnest(h3_grid_disk(cc.h3_centroid_cell, 1)) AS h3_covering_cell_key
+                FROM
+                    CatchmentCentroids cc
+            ) TO '{output_dir}catchment_h3_lookup.parquet'
+            WITH (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1);
+        """
+        )
+
+        conn.execute("DROP TABLE IF EXISTS catchment_h3_map;")
+
     print(f"Tables partitioned successfully to: {output_dir}")
 
 
@@ -674,7 +726,9 @@ def main():
                 fs, output_path = fsspec.core.url_to_fs(args.output_dir)
                 if fs.exists(output_path):
                     print(f"Error: S3 output directory {args.output_dir} already exists.")
-                    print("Remove the existing directory or use a different path.")
+                    print(
+                        "Use a different path. Be careful about what you delete on S3 if trying to overwrite a directory."
+                    )
                     exit(1)
                 print(f"S3 output directory {args.output_dir} validated - will be created during partitioning")
             except Exception as e:
@@ -698,13 +752,13 @@ def main():
         initialize_database(args.db_path, args.schema_path)
 
     if not args.skip_load or not db_exists:
-        hand_ver = args.hand_version
-        nwm_ver = Decimal(args.nwm_version)
+        hand_version = args.hand_version
+        nwm_version = Decimal(args.nwm_version)
 
         if args.skip_load and not db_exists:
             print(f"Warning: --skip-load specified but database {args.db_path} does not exist. Loading data...")
 
-        load_hand_suite(args.db_path, args.hand_dir, hand_ver, nwm_ver, args.batch_size)
+        load_hand_suite(args.db_path, args.hand_dir, hand_version, nwm_version, args.batch_size)
         print(f"\nData loaded into {args.db_path}")
     else:
         print(f"Skipping data load, using existing database: {args.db_path}")
