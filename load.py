@@ -23,56 +23,6 @@ from shapely.ops import unary_union
 SENTINEL = object()  # Use unique object to avoid accidental queue shutdown
 
 
-def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Process hydrotable dataframe by grouping by HydroID and converting multi-valued columns to arrays.
-    """
-    required_cols = ["HydroID"]
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}")
-
-    df["HydroID"] = df["HydroID"].astype(str)
-
-    for col in df.columns:
-        if col != "HydroID":
-            try:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            except (ValueError, TypeError):
-                pass
-
-    def aggregate_to_scalar_or_array(series):
-        """Return single value if all values are the same, otherwise return array of unique values.
-
-        This compresses data while preserving information - avoids storing redundant arrays
-        when all stage/discharge values are identical across reaches.
-        """
-        clean_values = series.dropna()
-        if clean_values.empty:
-            return None
-
-        unique_values = clean_values.unique()
-        if len(unique_values) == 1:
-            return unique_values[0]
-        else:
-            return list(unique_values)
-
-    agg_dict = {}
-    for col in df.columns:
-        if col != "HydroID":
-            agg_dict[col] = aggregate_to_scalar_or_array
-
-    df = df.sort_values(["HydroID"])
-    try:
-        grp = df.groupby("HydroID").agg(agg_dict).reset_index()
-        return grp
-    except Exception as e:
-        print(f"  Aggregation failed: {e}")
-        print(f"  DataFrame columns: {list(df.columns)}")
-        print(f"  Aggregation dict: {agg_dict}")
-        raise
-
-
 @contextlib.contextmanager
 def get_database_connection(db_path: str):
     """Context manager for DuckDB connections with spatial extension."""
@@ -156,6 +106,57 @@ def read_gpkg_fallback(path: str) -> gpd.GeoDataFrame:
     except DataSourceError:
         with fiona.open(path, driver="GPKG") as src:
             return gpd.GeoDataFrame.from_features(src, crs=src.crs)
+
+
+def aggregate_to_scalar_or_array(series):
+    """Return single value if all values are the same, otherwise return array of unique values.
+
+    This compresses data while preserving information - avoids storing redundant arrays
+    when all stage/discharge values are identical across reaches.
+    """
+    clean_values = series.dropna()
+    if clean_values.empty:
+        return None
+
+    unique_values = clean_values.unique()
+    if len(unique_values) == 1:
+        return unique_values[0]
+    else:
+        return list(unique_values)
+
+
+def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Process hydrotable dataframe by grouping by HydroID and converting multi-valued columns to arrays.
+    """
+    required_cols = ["HydroID"]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+
+    df["HydroID"] = df["HydroID"].astype(str)
+
+    for col in df.columns:
+        if col != "HydroID":
+            try:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            except (ValueError, TypeError):
+                pass
+
+    agg_dict = {}
+    for col in df.columns:
+        if col != "HydroID":
+            agg_dict[col] = aggregate_to_scalar_or_array
+
+    df = df.sort_values(["HydroID"])
+    try:
+        grp = df.groupby("HydroID").agg(agg_dict).reset_index()
+        return grp
+    except Exception as e:
+        print(f"  Aggregation failed: {e}")
+        print(f"  DataFrame columns: {list(df.columns)}")
+        print(f"  Aggregation dict: {agg_dict}")
+        raise
 
 
 def process_catchment_files(filesystem, directory_path: str) -> Tuple[List, Optional[str]]:
