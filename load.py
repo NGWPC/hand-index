@@ -2,7 +2,6 @@
 import argparse
 import concurrent.futures
 import contextlib
-import gc
 import multiprocessing
 import os
 import queue
@@ -239,7 +238,7 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version: str) -> Opti
             "catchment": {
                 "catchment_id": catchment_id,
                 "hand_version_id": hand_version,
-                "geometry_wkb": merged_geometry.wkb,
+                "geometry_wkt": merged_geometry.wkt,
                 "additional_attributes": None,
             },
             "hydrotables": hydrotable_records,
@@ -249,7 +248,6 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version: str) -> Opti
 
         # Explicit cleanup of large objects to reduce memory pressure
         del geometries, merged_geometry
-        gc.collect()
         return result
 
     except Exception as e:
@@ -272,9 +270,9 @@ def batch_insert_data(db_path: str, batch_data: List[Dict[str, Any]], valid_hydr
                 print(f"Batch inserting {len(catchments)} catchments...")
                 conn.executemany(
                     """INSERT INTO Catchments (catchment_id, hand_version_id, geometry, additional_attributes)
-                    VALUES (?, ?, ST_GeomFromWKB(?), ?) ON CONFLICT (catchment_id) DO NOTHING""",
+                    VALUES (?, ?, ?::GEOMETRY, ?) ON CONFLICT (catchment_id) DO NOTHING""",
                     [
-                        (r["catchment_id"], r["hand_version_id"], r["geometry_wkb"], r["additional_attributes"])
+                        (r["catchment_id"], r["hand_version_id"], r["geometry_wkt"], r["additional_attributes"])
                         for r in catchments
                     ],
                 )
@@ -452,7 +450,7 @@ def partition_tables_to_parquet(db_path: str, output_dir: str, h3_resolution: in
         print("Creating catchment H3 mapping...")
         conn.execute(f"""
             CREATE TEMP TABLE catchment_h3_map AS
-            SELECT catchment_id, {h3_calc} AS h3_partition_key FROM catchments c;
+            SELECT catchment_id, {h3_calc} AS h3_partition_key FROM catchments;
         """)
 
         # Partition hydrotables
