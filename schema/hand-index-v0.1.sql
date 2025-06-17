@@ -14,18 +14,12 @@ CREATE TABLE Hydrotables (
     hand_version_id TEXT,
     HydroID TEXT,
     nwm_version_id DECIMAL,
-    nwm_feature_id BIGINT,
+    feature_id BIGINT,
     stage DECIMAL[], 
     discharge_cms DECIMAL[], 
     default_discharge_cms DECIMAL[], 
-    precalib_discharge_cms DECIMAL[],
-    subdiv_discharge_cms DECIMAL[],
-    calb_coef_usgs DECIMAL,
-    calb_coef_ras2fim DECIMAL,
-    calb_coef_spatial DECIMAL,
-    calb_coef_final DECIMAL,
-    huc_id TEXT, 
-    lake_id TEXT,
+    HUC TEXT, 
+    LakeID TEXT,
     PRIMARY KEY (catchment_id, hand_version_id, HydroID)
 );
 
@@ -45,7 +39,7 @@ CREATE TABLE HAND_Catchment_Rasters (
 );
 
 -- Create indexes
-CREATE INDEX idx_hydrotables_nwm_feature ON Hydrotables(nwm_feature_id, nwm_version_id);
+CREATE INDEX idx_hydrotables_nwm_feature ON Hydrotables(feature_id, nwm_version_id);
 CREATE INDEX idx_hydrotables_catchment ON Hydrotables(catchment_id);
 CREATE INDEX idx_rem_rasters_catchment ON HAND_REM_Rasters(catchment_id);
 CREATE INDEX idx_catchment_rasters_rem ON HAND_Catchment_Rasters(rem_raster_id);
