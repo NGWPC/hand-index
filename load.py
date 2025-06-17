@@ -2,6 +2,7 @@
 import argparse
 import concurrent.futures
 import contextlib
+import gc
 import multiprocessing
 import os
 import queue
@@ -234,7 +235,7 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version: str) -> Opti
                 )
 
         print(f"  Successfully processed branch: {branch_dir}")
-        return {
+        result = {
             "catchment": {
                 "catchment_id": catchment_id,
                 "hand_version_id": hand_version,
@@ -245,6 +246,11 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version: str) -> Opti
             "rem_rasters": rem_raster_records,
             "catchment_rasters": catchment_raster_records,
         }
+
+        # Explicit cleanup of large objects to reduce memory pressure
+        del geometries, merged_geometry
+        gc.collect()
+        return result
 
     except Exception as e:
         print(f"  ERROR processing branch {branch_dir}: {e}")
