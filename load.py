@@ -450,7 +450,7 @@ def partition_tables_to_parquet(db_path: str, output_dir: str, h3_resolution: in
         print("Creating catchment H3 mapping...")
         conn.execute(f"""
             CREATE TEMP TABLE catchment_h3_map AS
-            SELECT catchment_id, {h3_calc} AS h3_partition_key FROM catchments;
+            SELECT catchment_id, {h3_calc} AS h3_partition_key FROM catchments c;
         """)
 
         # Partition hydrotables
