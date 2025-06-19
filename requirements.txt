@@ -8,3 +8,4 @@ fsspec
 folium
 branca
 s3fs
+pyarrow
