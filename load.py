@@ -475,23 +475,6 @@ def partition_tables_to_parquet(db_path: str, output_dir: str, h3_resolution: in
                 WITH (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1);
             """)
 
-        # Create H3 lookup table
-        print("Creating catchment H3 lookup table...")
-        conn.execute(f"""
-            COPY (
-                WITH CatchmentCentroids AS (
-                    SELECT c.catchment_id, {h3_calc} as h3_centroid_cell
-                    FROM catchments c
-                    WHERE c.geometry IS NOT NULL AND NOT ST_IsEmpty(c.geometry)
-                )
-                SELECT cc.catchment_id, unnest(h3_grid_disk(cc.h3_centroid_cell, 1)) AS h3_covering_cell_key
-                FROM CatchmentCentroids cc
-            ) TO '{output_dir}catchment_h3_lookup.parquet'
-            WITH (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1);
-        """)
-
-        conn.execute("DROP TABLE IF EXISTS catchment_h3_map;")
-
     print(f"Tables partitioned successfully to: {output_dir}")
 
 
@@ -506,7 +489,7 @@ def main():
     p.add_argument("--output-dir", help="Output directory for partitioned parquet files")
     p.add_argument("--skip-load", action="store_true", help="Skip loading data, only partition existing database")
     p.add_argument("--h3-resolution", type=int, default=1, help="H3 resolution for spatial partitioning (default: 1)")
-    p.add_argument("--batch-size", type=int, default=50, help="Number of branches per batch (default: 50)")
+    p.add_argument("--batch-size", type=int, default=1000, help="Number of branches per batch (default: 1000)")
     args = p.parse_args()
 
     db_exists = os.path.exists(args.db_path)
