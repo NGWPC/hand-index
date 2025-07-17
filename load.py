@@ -28,6 +28,40 @@ to_array_agg = lambda s: list(s.dropna()) or None
 to_scalar_agg = lambda s: s.dropna().iloc[0] if len(s.dropna()) > 0 else None
 
 
+def get_hydrotable_schema(db_path: str) -> Dict[str, Dict[str, Any]]:
+    """Get hydrotable schema information from database."""
+    with get_database_connection(db_path) as conn:
+        # Query table schema information (case-insensitive)
+        result = conn.execute("""
+            SELECT column_name, data_type, is_nullable 
+            FROM information_schema.columns 
+            WHERE lower(table_name) = 'hydrotables'
+            ORDER BY ordinal_position
+        """).fetchall()
+        
+        schema_info = {}
+        for row in result:
+            column_name, data_type, is_nullable = row
+            schema_info[column_name] = {
+                'type': data_type,
+                'nullable': is_nullable == 'YES',
+                'is_array': '[]' in data_type,
+                'is_numeric': any(num_type in data_type.upper() for num_type in 
+                                ['INTEGER', 'BIGINT', 'DECIMAL', 'DOUBLE', 'FLOAT', 'NUMERIC'])
+            }
+        
+        return schema_info
+
+
+def parse_hydrotable_columns(schema_info: Dict[str, Dict[str, Any]]) -> Tuple[set, set, set]:
+    """Parse schema to categorize columns for processing."""
+    valid_columns = set(schema_info.keys())
+    array_columns = {col for col, info in schema_info.items() if info['is_array']}
+    numeric_columns = {col for col, info in schema_info.items() if info['is_numeric']}
+    
+    return valid_columns, array_columns, numeric_columns
+
+
 def load_extensions(conn, extensions: List[str]):
     """Load DuckDB extensions."""
     for ext in extensions:
@@ -100,22 +134,28 @@ def list_branch_dirs(hand_dir: str) -> List[str]:
     return branch_dirs
 
 
-def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
+def process_hydrotable_data(df: pd.DataFrame, array_columns: set, numeric_columns: set) -> pd.DataFrame:
     """
-    Process hydrotable dataframe by grouping by HydroID and converting select columns to arrays for stoarge and query efficiency.
+    Process hydrotable dataframe by grouping by HydroID and converting select columns to arrays for storage and query efficiency.
+    Uses dynamic column information from database schema.
     """
     if "HydroID" not in df.columns:
         raise ValueError("Missing required column: HydroID")
 
     df["HydroID"] = df["HydroID"].astype(str)
 
-    numeric_cols = {"nwm_version_id", "feature_id", "stage", "discharge_cms", "default_discharge_cms"}
-    array_cols = {"stage", "discharge_cms", "default_discharge_cms"}
-
-    for col in [c for c in df.columns if c != "HydroID" and c in numeric_cols]:
+    # Convert numeric columns to proper types
+    for col in [c for c in df.columns if c != "HydroID" and c in numeric_columns]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    agg_dict = {col: (to_array_agg if col in array_cols else to_scalar_agg) for col in df.columns if col != "HydroID"}
+    # Create aggregation dictionary based on column types from schema
+    agg_dict = {}
+    for col in df.columns:
+        if col != "HydroID":
+            if col in array_columns:
+                agg_dict[col] = to_array_agg
+            else:
+                agg_dict[col] = to_scalar_agg
 
     return df.groupby("HydroID").agg(agg_dict).reset_index()
 
@@ -145,7 +185,7 @@ def process_files(fs, dir_path: str, pattern: str, protocol: str, processor=None
     return results
 
 
-def process_branch(branch_dir: str, hand_version: str, nwm_version: str) -> Optional[Dict[str, Any]]:
+def process_branch(branch_dir: str, hand_version: str, nwm_version: str, array_columns: set, numeric_columns: set) -> Optional[Dict[str, Any]]:
     """Process one branch directory and return data for batch insertion."""
     print(f"Processing branch: {branch_dir}")
 
@@ -185,7 +225,7 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version: str) -> Opti
 
             if dfs:
                 combined = pd.concat(dfs, ignore_index=True)
-                processed = process_hydrotable_data(combined)
+                processed = process_hydrotable_data(combined, array_columns, numeric_columns)
                 processed["catchment_id"] = catchment_id
                 processed["hand_version_id"] = hand_version
                 processed["nwm_version_id"] = nwm_version
@@ -336,21 +376,8 @@ def batch_insert_data(db_path: str, batch_data: List[Dict[str, Any]], valid_hydr
             raise
 
 
-def batch_writer(db_path: str, result_queue: queue.Queue, batch_size: int):
+def batch_writer(db_path: str, result_queue: queue.Queue, batch_size: int, valid_columns: set):
     """Batch writer thread that accumulates results and inserts to database."""
-    valid_cols = {
-        "catchment_id",
-        "hand_version_id",
-        "HydroID",
-        "nwm_version_id",
-        "feature_id",
-        "stage",
-        "discharge_cms",
-        "default_discharge_cms",
-        "HUC",
-        "LakeID",
-    }
-
     batch = []
     while True:
         item = result_queue.get()
@@ -359,11 +386,11 @@ def batch_writer(db_path: str, result_queue: queue.Queue, batch_size: int):
 
         batch.append(item)
         if len(batch) >= batch_size:
-            batch_insert_data(db_path, batch, valid_cols)
+            batch_insert_data(db_path, batch, valid_columns)
             batch = []
 
     if batch:
-        batch_insert_data(db_path, batch, valid_cols)
+        batch_insert_data(db_path, batch, valid_columns)
 
 
 def load_hand_suite(db_path: str, hand_dir: str, hand_version: str, nwm_version: Decimal, batch_size: int = 200):
@@ -375,16 +402,22 @@ def load_hand_suite(db_path: str, hand_dir: str, hand_version: str, nwm_version:
 
     print(f"Found {len(branch_dirs)} branch directories to process")
 
+    # Get schema information for dynamic column processing
+    print("Getting hydrotable schema information...")
+    schema_info = get_hydrotable_schema(db_path)
+    valid_columns, array_columns, numeric_columns = parse_hydrotable_columns(schema_info)
+    print(f"Found {len(valid_columns)} columns, {len(array_columns)} array columns, {len(numeric_columns)} numeric columns")
+
     # we are doing consumer producer pattern here
     # result_queue is consumer waiting for data from producers
     result_queue = queue.Queue()
-    writer_thread = threading.Thread(target=batch_writer, args=(db_path, result_queue, batch_size), daemon=True)
+    writer_thread = threading.Thread(target=batch_writer, args=(db_path, result_queue, batch_size, valid_columns), daemon=True)
     writer_thread.start()
 
     successful_count = 0
     # These are producers that will process branches in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-        futures = [executor.submit(process_branch, bd, hand_version, str(nwm_version)) for bd in branch_dirs]
+        futures = [executor.submit(process_branch, bd, hand_version, str(nwm_version), array_columns, numeric_columns) for bd in branch_dirs]
 
         for future in concurrent.futures.as_completed(futures):
             try:
