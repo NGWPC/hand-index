@@ -38,27 +38,29 @@ def get_hydrotable_schema(db_path: str) -> Dict[str, Dict[str, Any]]:
             WHERE lower(table_name) = 'hydrotables'
             ORDER BY ordinal_position
         """).fetchall()
-        
+
         schema_info = {}
         for row in result:
             column_name, data_type, is_nullable = row
             schema_info[column_name] = {
-                'type': data_type,
-                'nullable': is_nullable == 'YES',
-                'is_array': '[]' in data_type,
-                'is_numeric': any(num_type in data_type.upper() for num_type in 
-                                ['INTEGER', 'BIGINT', 'DECIMAL', 'DOUBLE', 'FLOAT', 'NUMERIC'])
+                "type": data_type,
+                "nullable": is_nullable == "YES",
+                "is_array": "[]" in data_type,
+                "is_numeric": any(
+                    num_type in data_type.upper()
+                    for num_type in ["INTEGER", "BIGINT", "DECIMAL", "DOUBLE", "FLOAT", "NUMERIC"]
+                ),
             }
-        
+
         return schema_info
 
 
 def parse_hydrotable_columns(schema_info: Dict[str, Dict[str, Any]]) -> Tuple[set, set, set]:
     """Parse schema to categorize columns for processing."""
     valid_columns = set(schema_info.keys())
-    array_columns = {col for col, info in schema_info.items() if info['is_array']}
-    numeric_columns = {col for col, info in schema_info.items() if info['is_numeric']}
-    
+    array_columns = {col for col, info in schema_info.items() if info["is_array"]}
+    numeric_columns = {col for col, info in schema_info.items() if info["is_numeric"]}
+
     return valid_columns, array_columns, numeric_columns
 
 
@@ -185,7 +187,9 @@ def process_files(fs, dir_path: str, pattern: str, protocol: str, processor=None
     return results
 
 
-def process_branch(branch_dir: str, hand_version: str, nwm_version: str, array_columns: set, numeric_columns: set) -> Optional[Dict[str, Any]]:
+def process_branch(
+    branch_dir: str, hand_version: str, nwm_version: str, array_columns: set, numeric_columns: set, calb: bool = True
+) -> Optional[Dict[str, Any]]:
     """Process one branch directory and return data for batch insertion."""
     print(f"Processing branch: {branch_dir}")
 
@@ -213,7 +217,13 @@ def process_branch(branch_dir: str, hand_version: str, nwm_version: str, array_c
 
         # Process hydrotables
         hydrotable_records = []
-        csv_files = process_files(fs, dir_path, "hydroTable_*.csv", protocol)
+        if calb:
+            # For calibrated data, look at HUC level (parent directory)
+            huc_path = str(Path(dir_path).parent)
+            csv_files = process_files(fs, huc_path, "hydroTable_*.csv", protocol)
+        else:
+            # For non-calibrated data, look at branch level
+            csv_files = process_files(fs, dir_path, "hydroTable_*.csv", protocol)
         if csv_files:
             dfs = []
             for csv_uri in csv_files:
@@ -393,7 +403,9 @@ def batch_writer(db_path: str, result_queue: queue.Queue, batch_size: int, valid
         batch_insert_data(db_path, batch, valid_columns)
 
 
-def load_hand_suite(db_path: str, hand_dir: str, hand_version: str, nwm_version: Decimal, batch_size: int = 200):
+def load_hand_suite(
+    db_path: str, hand_dir: str, hand_version: str, nwm_version: Decimal, batch_size: int = 200, calb: bool = True
+):
     """Load HAND data suite into DuckDB with batch processing."""
     branch_dirs = list_branch_dirs(hand_dir)
     if not branch_dirs:
@@ -406,18 +418,25 @@ def load_hand_suite(db_path: str, hand_dir: str, hand_version: str, nwm_version:
     print("Getting hydrotable schema information...")
     schema_info = get_hydrotable_schema(db_path)
     valid_columns, array_columns, numeric_columns = parse_hydrotable_columns(schema_info)
-    print(f"Found {len(valid_columns)} columns, {len(array_columns)} array columns, {len(numeric_columns)} numeric columns")
+    print(
+        f"Found {len(valid_columns)} columns, {len(array_columns)} array columns, {len(numeric_columns)} numeric columns"
+    )
 
     # we are doing consumer producer pattern here
     # result_queue is consumer waiting for data from producers
     result_queue = queue.Queue()
-    writer_thread = threading.Thread(target=batch_writer, args=(db_path, result_queue, batch_size, valid_columns), daemon=True)
+    writer_thread = threading.Thread(
+        target=batch_writer, args=(db_path, result_queue, batch_size, valid_columns), daemon=True
+    )
     writer_thread.start()
 
     successful_count = 0
     # These are producers that will process branches in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-        futures = [executor.submit(process_branch, bd, hand_version, str(nwm_version), array_columns, numeric_columns) for bd in branch_dirs]
+        futures = [
+            executor.submit(process_branch, bd, hand_version, str(nwm_version), array_columns, numeric_columns, calb)
+            for bd in branch_dirs
+        ]
 
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -523,6 +542,11 @@ def main():
     p.add_argument("--skip-load", action="store_true", help="Skip loading data, only partition existing database")
     p.add_argument("--h3-resolution", type=int, default=1, help="H3 resolution for spatial partitioning (default: 1)")
     p.add_argument("--batch-size", type=int, default=1000, help="Number of branches per batch (default: 1000)")
+    p.add_argument(
+        "--calb",
+        action="store_true",
+        help="Use calibrated HAND version (look for hydrotables at HUC level)",
+    )
     args = p.parse_args()
 
     db_exists = os.path.exists(args.db_path)
@@ -561,7 +585,9 @@ def main():
     if not args.skip_load or not db_exists:
         if args.skip_load and not db_exists:
             print(f"Warning: --skip-load specified but database doesn't exist. Loading data...")
-        load_hand_suite(args.db_path, args.hand_dir, args.hand_version, Decimal(args.nwm_version), args.batch_size)
+        load_hand_suite(
+            args.db_path, args.hand_dir, args.hand_version, Decimal(args.nwm_version), args.batch_size, args.calb
+        )
         print(f"\nData loaded into {args.db_path}")
     else:
         print(f"Skipping data load, using existing database: {args.db_path}")
