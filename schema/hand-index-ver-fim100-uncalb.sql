@@ -5,8 +5,9 @@ LOAD spatial;
 CREATE TABLE Catchments (
     catchment_id UUID PRIMARY KEY,
     hand_version_id TEXT, 
-    geometry GEOMETRY,
-    additional_attributes JSON
+    geometry VARCHAR, -- storing geometry as WKT
+    h3_index BIGINT,
+    branch_path TEXT
 );
 
 CREATE TABLE Hydrotables (
@@ -14,6 +15,7 @@ CREATE TABLE Hydrotables (
     hand_version_id TEXT,
     HydroID TEXT,
     nwm_version_id DECIMAL,
+    h3_index BIGINT,
     feature_id BIGINT,
     NextDownID BIGINT,
     order_ INTEGER,
@@ -75,6 +77,4 @@ CREATE INDEX idx_hydrotables_nwm_feature ON Hydrotables(feature_id, nwm_version_
 CREATE INDEX idx_hydrotables_catchment ON Hydrotables(catchment_id);
 CREATE INDEX idx_rem_rasters_catchment ON HAND_REM_Rasters(catchment_id);
 CREATE INDEX idx_catchment_rasters_rem ON HAND_Catchment_Rasters(rem_raster_id);
-
--- Create spatial index for geometry column
-CREATE INDEX idx_catchments_geometry ON Catchments USING RTREE (geometry);
+CREATE INDEX idx_catchments_branch_path ON Catchments(branch_path);

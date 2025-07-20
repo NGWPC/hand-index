@@ -69,9 +69,9 @@ def _partitioned_query_cte(wkt4326: str) -> str:
       SELECT
         c.catchment_id,
         c.geometry,
-        c.h3_partition_key
+        c.h3_index
       FROM catchments_partitioned c
-      JOIN transformed_query tq ON ST_Intersects(c.geometry, tq.query_geom)
+      JOIN transformed_query tq ON ST_Intersects(ST_GeomFromText(c.geometry), tq.query_geom)
     )
     """
 
@@ -114,7 +114,7 @@ def get_catchment_data_for_geojson_poly_split_partitioned(
         + """
     SELECT
       fc.catchment_id,
-      ST_AsWKB(fc.geometry) AS geom_wkb
+      fc.geometry AS geom_wkt
     FROM filtered_catchments AS fc;
     """
     )
@@ -124,11 +124,12 @@ def get_catchment_data_for_geojson_poly_split_partitioned(
         empty_gdf = gpd.GeoDataFrame(columns=["catchment_id", "geometry"], geometry="geometry", crs="EPSG:5070")
         return empty_gdf, pd.DataFrame(), query_poly_5070
 
-    # Decode WKB → shapely geometries
-    wkb_series = geom_df["geom_wkb"].apply(lambda x: bytes(x) if isinstance(x, bytearray) else x)
+    # Convert WKT → shapely geometries
+    from shapely import wkt
+    wkt_series = geom_df["geom_wkt"]
     geometries_gdf = gpd.GeoDataFrame(
         geom_df[["catchment_id"]],
-        geometry=gpd.GeoSeries.from_wkb(wkb_series, crs="EPSG:5070"),
+        geometry=gpd.GeoSeries.from_wkt(wkt_series, crs="EPSG:5070"),
         crs="EPSG:5070",
     )
 
@@ -138,7 +139,7 @@ def get_catchment_data_for_geojson_poly_split_partitioned(
         + """
     SELECT
       fc.catchment_id,
-      h.* EXCLUDE (catchment_id, h3_partition_key),
+      h.* EXCLUDE (catchment_id, h3_index),
       hrr.rem_raster_id,
       hrr.raster_path AS rem_raster_path,
       hcr.raster_path AS catchment_raster_path

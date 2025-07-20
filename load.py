@@ -1,559 +1,363 @@
-#!/usr/bin/env python3
 import argparse
-import concurrent.futures
-import contextlib
-import multiprocessing
+import gc
 import os
-import queue
 import tempfile
-import threading
-import uuid as py_uuid
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
-import fiona
 import fsspec
-import geopandas as gpd
-import pandas as pd
-from pyogrio.errors import DataSourceError
-from shapely.ops import unary_union
-
-SENTINEL = object()  # Use unique object to avoid accidental queue shutdown
-UUID_NAMESPACE = py_uuid.NAMESPACE_DNS  # Cache UUID namespace for performance
-
-# Aggregation helpers defined here for performance
-to_array_agg = lambda s: list(s.dropna()) or None
-to_scalar_agg = lambda s: s.dropna().iloc[0] if len(s.dropna()) > 0 else None
+import s3fs
 
 
-def get_hydrotable_schema(db_path: str) -> Dict[str, Dict[str, Any]]:
-    """Get hydrotable schema information from database."""
-    with get_database_connection(db_path) as conn:
-        # Query table schema information (case-insensitive)
-        result = conn.execute("""
-            SELECT column_name, data_type, is_nullable 
-            FROM information_schema.columns 
-            WHERE lower(table_name) = 'hydrotables'
-            ORDER BY ordinal_position
-        """).fetchall()
-
-        schema_info = {}
-        for row in result:
-            column_name, data_type, is_nullable = row
-            schema_info[column_name] = {
-                "type": data_type,
-                "nullable": is_nullable == "YES",
-                "is_array": "[]" in data_type,
-                "is_numeric": any(
-                    num_type in data_type.upper()
-                    for num_type in ["INTEGER", "BIGINT", "DECIMAL", "DOUBLE", "FLOAT", "NUMERIC"]
-                ),
-            }
-
-        return schema_info
-
-
-def parse_hydrotable_columns(schema_info: Dict[str, Dict[str, Any]]) -> Tuple[set, set, set]:
-    """Parse schema to categorize columns for processing."""
-    valid_columns = set(schema_info.keys())
-    array_columns = {col for col, info in schema_info.items() if info["is_array"]}
-    numeric_columns = {col for col, info in schema_info.items() if info["is_numeric"]}
-
-    return valid_columns, array_columns, numeric_columns
-
-
-def load_extensions(conn, extensions: List[str]):
-    """Load DuckDB extensions."""
-    for ext in extensions:
-        try:
-            conn.execute(f"INSTALL {ext}{' FROM community' if ext == 'h3' else ''}; LOAD {ext};")
-        except:
-            pass
-
-
-@contextlib.contextmanager
-def get_database_connection(db_path: str):
-    """Context manager for DuckDB connections with spatial extension."""
-    conn = duckdb.connect(db_path)
+def download_s3_file(s3_path: str, local_path: str, fs: s3fs.S3FileSystem) -> str:
+    """Download a single file from S3 to local filesystem. This gets used to download many files in parallel in load_hand_suite when working with the catchment gpkg's. Downloading the gpkg data locally ended up being faster. Most likely because of high-latency seeks in GPKG files when trying to interact with them over S3."""
     try:
-        load_extensions(conn, ["spatial"])
-        yield conn
-    finally:
-        conn.close()
-
-
-def initialize_database(db_path: str, schema_path: str):
-    """Initialize the DuckDB database with schema."""
-    with get_database_connection(db_path) as conn:
-        with open(schema_path, "r") as f:
-            for stmt in [s.strip() for s in f.read().split(";") if s.strip()]:
-                try:
-                    conn.execute(stmt)
-                except Exception as e:
-                    print(f"Warning: Failed to execute statement: {stmt[:50]}... Error: {e}")
-    print(f"Database initialized at: {db_path}")
-
-
-@contextlib.contextmanager
-def fetch_local(path: str):
-    """Download S3 files to local temp directory - required because some libraries need local file access."""
-    if not path.lower().startswith(("s3://", "s3a://")):
-        yield path
-        return
-
-    fs, anon_path = fsspec.core.url_to_fs(path)
-    fd, local_path = tempfile.mkstemp(suffix=Path(anon_path).name)
-    os.close(fd)
-    try:
-        fs.get(anon_path, local_path)
-        yield local_path
-    finally:
-        if os.path.exists(local_path):
-            os.remove(local_path)
-
-
-def make_uri(path: str, protocol: str) -> str:
-    """flexible uri creation"""
-    return path if protocol == "file" else f"{protocol}://{path}"
-
-
-def list_branch_dirs(hand_dir: str) -> List[str]:
-    """Find all branch directories in the HAND directory structure."""
-    fs, root_path = fsspec.core.url_to_fs(hand_dir)
-    protocol = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
-    branch_dirs = []
-
-    for dir_info in fs.ls(root_path, detail=True):
-        if dir_info["type"] != "directory":
-            continue
-        branches_path = f"{dir_info['name']}/branches"
-        if fs.exists(branches_path):
-            branch_dirs.extend(
-                [make_uri(b["name"], protocol) for b in fs.ls(branches_path, detail=True) if b["type"] == "directory"]
-            )
-    return branch_dirs
-
-
-def process_hydrotable_data(df: pd.DataFrame, array_columns: set, numeric_columns: set) -> pd.DataFrame:
-    """
-    Process hydrotable dataframe by grouping by HydroID and converting select columns to arrays for storage and query efficiency.
-    Uses dynamic column information from database schema.
-    """
-    if "HydroID" not in df.columns:
-        raise ValueError("Missing required column: HydroID")
-
-    df["HydroID"] = df["HydroID"].astype(str)
-
-    # Convert numeric columns to proper types
-    for col in [c for c in df.columns if c != "HydroID" and c in numeric_columns]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Create aggregation dictionary based on column types from schema
-    agg_dict = {}
-    for col in df.columns:
-        if col != "HydroID":
-            if col in array_columns:
-                agg_dict[col] = to_array_agg
-            else:
-                agg_dict[col] = to_scalar_agg
-
-    return df.groupby("HydroID").agg(agg_dict).reset_index()
-
-
-def read_geometries(file_uri: str) -> gpd.GeoDataFrame:
-    """Read geometries from file, with fallback to fiona."""
-    with fetch_local(file_uri) as local_file:
-        try:
-            return gpd.read_file(local_file)
-        except DataSourceError:
-            with fiona.open(local_file, driver="GPKG") as src:
-                return gpd.GeoDataFrame.from_features(src, crs=src.crs)
-
-
-def process_files(fs, dir_path: str, pattern: str, protocol: str, processor=None) -> List[Any]:
-    """Generic file processor."""
-    results = []
-    for file_path in fs.glob(f"{dir_path}/{pattern}"):
-        try:
-            file_uri = make_uri(file_path, protocol)
-            if processor:
-                results.append(processor(file_uri))
-            else:
-                results.append(file_uri)
-        except Exception as e:
-            print(f"  ERROR processing {file_path}: {e}")
-    return results
-
-
-def process_branch(
-    branch_dir: str, hand_version: str, nwm_version: str, array_columns: set, numeric_columns: set, calb: bool = True
-) -> Optional[Dict[str, Any]]:
-    """Process one branch directory and return data for batch insertion."""
-    print(f"Processing branch: {branch_dir}")
-
-    try:
-        fs, dir_path = fsspec.core.url_to_fs(branch_dir)
-        protocol = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
-
-        # Process catchment geometries
-        geometries = []
-        catchment_crs = None
-        for gdf in process_files(fs, dir_path, "*gw_catchments*.gpkg", protocol, read_geometries):
-            if not gdf.empty:
-                catchment_crs = catchment_crs or gdf.crs.to_string()
-                geometries.append(unary_union(gdf.geometry))
-
-        if not geometries:
-            print(f"  No catchment geometries found in {branch_dir}")
-            return None
-
-        # Create catchment ID
-        merged_geometry = unary_union(geometries)
-        path_parts = branch_dir.split(f"{hand_version}/", 1)
-        relative_path = f"{hand_version}/{path_parts[1]}" if len(path_parts) == 2 else branch_dir
-        catchment_id = str(py_uuid.uuid5(UUID_NAMESPACE, f"{relative_path}:{merged_geometry.wkt}"))
-
-        # Process hydrotables
-        hydrotable_records = []
-        if calb:
-            # For calibrated data, look at HUC level (parent directory)
-            huc_path = str(Path(dir_path).parent)
-            csv_files = process_files(fs, huc_path, "hydroTable_*.csv", protocol)
-        else:
-            # For non-calibrated data, look at branch level
-            csv_files = process_files(fs, dir_path, "hydroTable_*.csv", protocol)
-        if csv_files:
-            dfs = []
-            for csv_uri in csv_files:
-                with fetch_local(csv_uri) as local_file:
-                    try:
-                        dfs.append(pd.read_csv(local_file))
-                    except Exception as e:
-                        print(f"  couldn't read CSV: {csv_uri} because of {e}")
-
-            if dfs:
-                combined = pd.concat(dfs, ignore_index=True)
-                processed = process_hydrotable_data(combined, array_columns, numeric_columns)
-                processed["catchment_id"] = catchment_id
-                processed["hand_version_id"] = hand_version
-                processed["nwm_version_id"] = nwm_version
-                hydrotable_records = processed.to_dict("records")
-
-                del dfs, combined, processed
-        # Process rasters
-        rem_raster_records = []
-        catchment_raster_records = []
-
-        rem_files = fs.glob(f"{dir_path}/*rem_zeroed*.tif")
-        if rem_files:
-            if len(rem_files) > 1:
-                print(f"WARNING: Multiple REM rasters found in {dir_path}")
-            rem_uri = make_uri(rem_files[0], protocol)
-            parts = rem_uri.split(f"{hand_version}/", 1)
-            rel_uri = f"{hand_version}/{parts[1]}" if len(parts) == 2 else rem_uri
-            rem_id = str(py_uuid.uuid5(UUID_NAMESPACE, f"{catchment_id}:{rel_uri}"))
-
-            rem_raster_records.append(
-                {
-                    "rem_raster_id": rem_id,
-                    "catchment_id": catchment_id,
-                    "hand_version_id": hand_version,
-                    "raster_path": rem_uri,
-                    "metadata": None,
-                }
-            )
-
-            catch_files = fs.glob(f"{dir_path}/*gw_catchments_reaches*.tif")
-            if catch_files:
-                if len(catch_files) > 1:
-                    print(f"WARNING: Multiple catchment rasters found in {dir_path}")
-                catch_uri = make_uri(catch_files[0], protocol)
-                parts = catch_uri.split(f"{hand_version}/", 1)
-                rel_uri = f"{hand_version}/{parts[1]}" if len(parts) == 2 else catch_uri
-                catch_id = str(py_uuid.uuid5(UUID_NAMESPACE, f"{rem_id}:{rel_uri}"))
-
-                catchment_raster_records.append(
-                    {
-                        "catchment_raster_id": catch_id,
-                        "rem_raster_id": rem_id,
-                        "raster_path": catch_uri,
-                        "metadata": None,
-                    }
-                )
-
-        print(f"  Successfully processed branch: {branch_dir}")
-        result = {
-            "catchment": {
-                "catchment_id": catchment_id,
-                "hand_version_id": hand_version,
-                "geometry_wkt": merged_geometry.wkt,
-                "additional_attributes": None,
-            },
-            "hydrotables": hydrotable_records,
-            "rem_rasters": rem_raster_records,
-            "catchment_rasters": catchment_raster_records,
-        }
-
-        # Explicit cleanup of large objects to reduce memory pressure
-        del geometries, merged_geometry
-        return result
-
+        fs.get(s3_path, local_path)
+        return local_path
     except Exception as e:
-        print(f"  ERROR processing branch {branch_dir}: {e}")
+        print(f"Failed to download {s3_path}: {e}")
         return None
 
 
-def batch_insert_data(db_path: str, batch_data: List[Dict[str, Any]], valid_hydrotable_columns: set):
-    """Perform batch insertions into the database."""
-    if not batch_data:
-        return
-
-    with get_database_connection(db_path) as conn:
-        try:
-            conn.execute("BEGIN TRANSACTION;")
-
-            # Insert catchments
-            catchments = [d["catchment"] for d in batch_data if d and "catchment" in d]
-            if catchments:
-                print(f"Batch inserting {len(catchments)} catchments...")
-                conn.executemany(
-                    """INSERT INTO Catchments (catchment_id, hand_version_id, geometry, additional_attributes)
-                    VALUES (?, ?, ?::GEOMETRY, ?) ON CONFLICT (catchment_id) DO NOTHING""",
-                    [
-                        (r["catchment_id"], r["hand_version_id"], r["geometry_wkt"], r["additional_attributes"])
-                        for r in catchments
-                    ],
-                )
-
-            # Insert hydrotables
-            hydrotables = [ht for d in batch_data if d for ht in d.get("hydrotables", [])]
-            if hydrotables:
-                print(f"Batch inserting {len(hydrotables)} hydrotable records...")
-                # Get valid columns
-                # Fast path: check if all records have same columns (common case)
-                first_cols = set(hydrotables[0].keys())
-                if len(hydrotables) == 1 or all(set(r.keys()) == first_cols for r in hydrotables[1:3]):
-                    cols = sorted(first_cols & valid_hydrotable_columns)
-                else:
-                    # Slow path: records have different columns
-                    cols = sorted(set().union(*(set(r.keys()) for r in hydrotables)) & valid_hydrotable_columns)
-
-                # Escape column names with double quotes to handle special characters
-                escaped_cols = [f'"{col}"' for col in cols]
-                conn.executemany(
-                    f"""INSERT INTO Hydrotables ({', '.join(escaped_cols)})
-                    VALUES ({', '.join(['?']*len(cols))})
-                    ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING""",
-                    [tuple(r.get(col) for col in cols) for r in hydrotables],
-                )
-
-            # Insert REM rasters
-            rem_rasters = [rr for d in batch_data if d for rr in d.get("rem_rasters", [])]
-            if rem_rasters:
-                print(f"Batch inserting {len(rem_rasters)} REM rasters...")
-                conn.executemany(
-                    """INSERT INTO HAND_REM_Rasters (rem_raster_id, catchment_id, hand_version_id, raster_path, metadata)
-                    VALUES (?, ?, ?, ?, ?) ON CONFLICT (rem_raster_id) DO NOTHING""",
-                    [
-                        (r["rem_raster_id"], r["catchment_id"], r["hand_version_id"], r["raster_path"], r["metadata"])
-                        for r in rem_rasters
-                    ],
-                )
-
-            # Insert catchment rasters
-            catch_rasters = [cr for d in batch_data if d for cr in d.get("catchment_rasters", [])]
-            if catch_rasters:
-                print(f"Batch inserting {len(catch_rasters)} catchment rasters...")
-                conn.executemany(
-                    """INSERT INTO HAND_Catchment_Rasters (catchment_raster_id, rem_raster_id, raster_path, metadata)
-                    VALUES (?, ?, ?, ?) ON CONFLICT (catchment_raster_id) DO NOTHING""",
-                    [
-                        (r["catchment_raster_id"], r["rem_raster_id"], r["raster_path"], r["metadata"])
-                        for r in catch_rasters
-                    ],
-                )
-
-            conn.execute("COMMIT;")
-            print(f"Successfully batch inserted data from {len(batch_data)} branches")
-
-            batch_data.clear()
-
-        except Exception as e:
-            conn.execute("ROLLBACK;")
-            print(f"Error in batch insert: {e}")
-            raise
-
-
-def batch_writer(db_path: str, result_queue: queue.Queue, batch_size: int, valid_columns: set):
-    """Batch writer thread that accumulates results and inserts to database."""
-    batch = []
-    while True:
-        item = result_queue.get()
-        if item is SENTINEL:
-            break
-
-        batch.append(item)
-        if len(batch) >= batch_size:
-            batch_insert_data(db_path, batch, valid_columns)
-            batch = []
-
-    if batch:
-        batch_insert_data(db_path, batch, valid_columns)
-
-
 def load_hand_suite(
-    db_path: str, hand_dir: str, hand_version: str, nwm_version: Decimal, batch_size: int = 200, calb: bool = True
+    db_path: str,
+    hand_dir: str,
+    hand_version: str,
+    nwm_version: str,
+    h3_resolution: int,
+    calb: bool,
+    batch_size: int = 100,
 ):
-    """Load HAND data suite into DuckDB with batch processing."""
-    branch_dirs = list_branch_dirs(hand_dir)
-    if not branch_dirs:
-        print("No branch directories found - exiting")
-        return
+    """
+    Loads HAND data into DuckDB using parallel downloads and processing.
+    """
+    start_time = time.time()
 
-    print(f"Found {len(branch_dirs)} branch directories to process")
+    hand_dir = hand_dir.rstrip("/") + "/"
+    base_glob_path = f"{hand_dir}*/branches/*"
+    gpkg_glob = f"{base_glob_path}/*gw_catchments*.gpkg"
+    csv_glob_path = f"{hand_dir}*/" if calb else f"{base_glob_path}/"
+    csv_glob = f"{csv_glob_path}hydroTable_*.csv"
+    catch_glob = f"{base_glob_path}/*gw_catchments_reaches*.tif"
+    rem_glob = f"{base_glob_path}/*rem_zeroed*.tif"
 
-    # Get schema information for dynamic column processing
-    print("Getting hydrotable schema information...")
-    schema_info = get_hydrotable_schema(db_path)
-    valid_columns, array_columns, numeric_columns = parse_hydrotable_columns(schema_info)
-    print(
-        f"Found {len(valid_columns)} columns, {len(array_columns)} array columns, {len(numeric_columns)} numeric columns"
-    )
+    conn = duckdb.connect(db_path)
+    try:
+        print("\nLoading extensions (httpfs, spatial, h3, aws)...")
+        conn.execute("INSTALL httpfs; LOAD httpfs; INSTALL spatial; LOAD spatial;")
+        conn.execute("INSTALL h3 FROM community; LOAD h3;")
+        conn.execute("INSTALL aws; LOAD aws;")
 
-    # we are doing consumer producer pattern here
-    # result_queue is consumer waiting for data from producers
-    result_queue = queue.Queue()
-    writer_thread = threading.Thread(
-        target=batch_writer, args=(db_path, result_queue, batch_size, valid_columns), daemon=True
-    )
-    writer_thread.start()
+        conn.execute("SET preserve_insertion_order=false;")  # Improve performance
 
-    successful_count = 0
-    # These are producers that will process branches in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-        futures = [
-            executor.submit(process_branch, bd, hand_version, str(nwm_version), array_columns, numeric_columns, calb)
-            for bd in branch_dirs
-        ]
+        print("Processing and inserting Catchment geometries...")
 
-        for future in concurrent.futures.as_completed(futures):
+        # First get the list of files, then build a dynamic query
+        file_list_query = f"SELECT file FROM glob('{gpkg_glob}')"
+        files = conn.execute(file_list_query).fetchall()
+
+        if not files:
+            print("WARNING: No GeoPackage files found. Skipping catchment ingestion.")
+            return
+
+        print(f"Found {len(files)} GeoPackage files to process.")
+
+        # Group files by branch directory and pick one file per branch (excluding gw_catchments_pixels_ files since they are different than the other gw_catchment files)
+        print("Grouping files by branch directory...")
+        branch_to_file = {}
+        for (file_path,) in files:
+            if "/branches/" in file_path and "_pixels_" not in file_path:
+                # Extract branch directory
+                parts = file_path.split("/branches/")
+                if len(parts) > 1:
+                    branch_dir = parts[0] + "/branches/" + parts[1].split("/")[0] + "/"
+                    if branch_dir not in branch_to_file:
+                        branch_to_file[branch_dir] = file_path  # Just take the first file found
+
+        print(f"Found {len(branch_to_file)} unique branches from {len(files)} files.")
+
+        # Process files in batches
+        branch_files = list(branch_to_file.items())
+        total_inserted = 0
+
+        # Initialize S3 filesystem for parallel downloads if needed
+        fs = s3fs.S3FileSystem() if hand_dir.startswith("s3://") else None
+
+        for i in range(0, len(branch_files), batch_size):
+            batch_branches = branch_files[i : i + batch_size]
+            print(
+                f"Processing batch {i//batch_size + 1}/{(len(branch_files) + batch_size - 1)//batch_size} ({len(batch_branches)} branches)..."
+            )
+
+            # Download files in parallel if using S3
+            local_file_paths = []
+            temp_dir = None
+
+            if fs:
+                temp_dir = tempfile.mkdtemp()
+
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    # Submit download tasks
+                    future_to_file = {}
+                    for j, (branch_dir, file_path) in enumerate(batch_branches):
+                        local_path = os.path.join(temp_dir, f"batch_{i}_{j}.gpkg")
+                        future = executor.submit(download_s3_file, file_path, local_path, fs)
+                        future_to_file[future] = (branch_dir, file_path, local_path)
+
+                    # Collect results
+                    for future in as_completed(future_to_file):
+                        branch_dir, original_path, local_path = future_to_file[future]
+                        result = future.result()
+                        if result:
+                            local_file_paths.append((branch_dir, original_path, local_path))
+                        else:
+                            print(f"Skipping failed download: {original_path}")
+
+                print(f"Successfully downloaded {len(local_file_paths)} files.")
+            else:
+                # Use original paths for local files
+                local_file_paths = [(branch_dir, file_path, file_path) for branch_dir, file_path in batch_branches]
+
+            # Process each file individually - directly insert all geometries from GPKG
+            print(f"Processing {len(local_file_paths)} files...")
+            batch_inserted = 0
+
+            # Batch files to reduce round trips while avoiding single giant query
+            for i in range(0, len(local_file_paths), batch_size):
+                batch = local_file_paths[i : i + batch_size]
+
+                # Build UNION ALL query for this batch
+                union_parts = []
+                for branch_dir, _, local_path in batch:
+                    union_parts.append(f"""
+                    SELECT 
+                        uuid() AS catchment_id,
+                        '{hand_version}' AS hand_version_id,
+                        ST_AsText(ST_Force2D(geom)) AS geometry,
+                        h3_latlng_to_cell(
+                            ST_Y(ST_Transform(ST_Centroid(geom), 'EPSG:5070', 'EPSG:4326', true)),
+                            ST_X(ST_Transform(ST_Centroid(geom), 'EPSG:5070', 'EPSG:4326', true)),
+                            {h3_resolution}
+                        ) AS h3_index,
+                        '{branch_dir}' AS branch_path
+                    FROM ST_Read('{local_path}')
+                    """)
+
+                batch_insert_sql = f"""
+                INSERT INTO Catchments (catchment_id, hand_version_id, geometry, h3_index, branch_path)
+                {' UNION ALL '.join(union_parts)}
+                ON CONFLICT (catchment_id) DO NOTHING;
+                """
+
+                try:
+                    result = conn.execute(batch_insert_sql)
+                    records_inserted = result.rowcount if hasattr(result, "rowcount") else len(batch)
+                    batch_inserted += records_inserted
+                except Exception as e:
+                    print(f"Error processing batch starting at index {i}: {e}")
+                    continue
+
+                # clean up any intermediate/cached results. Reconnecting to duckdb resets its memory usage
+                conn.close()
+                conn = duckdb.connect(db_path)
+                conn.execute("LOAD httpfs; LOAD spatial; LOAD h3; LOAD aws;")
+
+            total_inserted += batch_inserted
+            print(f"-> Batch inserted {batch_inserted} catchment records.")
+
+            # Clean up temporary files
+            if temp_dir and os.path.exists(temp_dir):
+                import shutil
+
+                shutil.rmtree(temp_dir)
+
+        print(f"-> Total inserted/updated {total_inserted} catchment records.")
+
+        # Loading entire catchments table first for data integrity. Catchments must exist before Hydrotables can reference them.
+
+        print("\nProcessing and inserting HydroTable data (with h3_index)...")
+        csv_dir_extractor = f"regexp_extract(filename, '(.*/{'branches/[^/]+/' if not calb else '[^/]+/'})')"
+
+        # Build dynamic aggregation SQL using DuckDB metadata. Doing it this way so that this script doesn't need to have any knowledge of the columns in the hydrotable.csv's. As long as the hydrotables schema has the correct numeric and numeric array types and the same column names as the csv's you are ingesting then the code is able to figure out which columns in hydrotable csv need to be aggregated to arrays and which columns to leave as scalars. Aggregation is by HydroID
+        agg_sql = conn.execute("""
+            WITH column_info AS (
+                SELECT column_name, data_type,
+                       CASE 
+                           WHEN data_type LIKE '%[]%' THEN 'ARRAY_AGG(raw_csv_data."' || column_name || '") AS "' || column_name || '"'
+                           ELSE 'FIRST(raw_csv_data."' || column_name || '") AS "' || column_name || '"'
+                       END AS agg_clause
+                FROM information_schema.columns 
+                WHERE table_name = 'Hydrotables' AND table_schema = 'main'
+                AND column_name NOT IN ('catchment_id', 'hand_version_id', 'HydroID', 'nwm_version_id', 'h3_index')
+            )
+            SELECT string_agg(agg_clause, ', ') AS dynamic_agg_clause
+            FROM column_info
+        """).fetchone()[0]
+
+        # First, get list of all CSV files to process
+        print("Discovering CSV files...")
+        # Use glob to get file list without reading CSV content
+        csv_files_query = f"SELECT file FROM glob('{csv_glob}')"
+        csv_files = [row[0] for row in conn.execute(csv_files_query).fetchall()]
+        print(f"Found {len(csv_files)} CSV files to process")
+
+        # Process CSVs in batches using the provided batch_size parameter
+        total_inserted = 0
+
+        for i in range(0, len(csv_files), batch_size):
+            batch_files = csv_files[i : i + batch_size]
+            batch_num = i // batch_size + 1
+            total_batches = (len(csv_files) + batch_size - 1) // batch_size
+            print(f"Processing batch {batch_num}/{total_batches} ({len(batch_files)} files)...")
+
+            # Create a union of the batch files
+            file_unions = " UNION ALL ".join(
+                [
+                    f"SELECT {csv_dir_extractor} AS csv_dir, * FROM read_csv_auto('{file}', filename=TRUE, union_by_name=TRUE, all_varchar=TRUE)"
+                    for file in batch_files
+                ]
+            )
+
+            hydrotable_insert_sql = f"""
+            WITH raw_csv_data AS (
+                {file_unions}
+            )
+            INSERT INTO Hydrotables
+            SELECT
+                c.catchment_id,
+                '{hand_version}' as hand_version_id,
+                raw_csv_data.HydroID,
+                '{nwm_version}' as nwm_version_id,
+                FIRST(c.h3_index) as h3_index,
+                {agg_sql}
+            FROM raw_csv_data
+            JOIN Catchments c ON c.branch_path = raw_csv_data.csv_dir
+            WHERE "HydroID" IS NOT NULL AND "HydroID" != ''
+            GROUP BY c.catchment_id, raw_csv_data.HydroID
+            ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING;
+            """
+
             try:
-                result = future.result()
-                if result:
-                    result_queue.put(result)
-                    successful_count += 1
+                result = conn.execute(hydrotable_insert_sql)
+                rowcount = result.rowcount if hasattr(result, "rowcount") else 0
+                total_inserted += rowcount
+                print(f"  -> Batch {batch_num} inserted.")
             except Exception as e:
-                print(f"Error processing branch: {e}")
+                print(f"  -> Error in batch {batch_num}: {e}")
+                # Continue with next batch instead of failing completely
+                continue
 
-    # stop the writer thread
-    # and wait for it to finish
-    result_queue.put(SENTINEL)
-    writer_thread.join()
+            # clean up any intermediate/cached results. Reconnecting to duckdb resets its memory usage
+            conn.close()
+            conn = duckdb.connect(db_path)
+            conn.execute("LOAD httpfs; LOAD spatial; LOAD h3; LOAD aws;")
 
-    print(f"Successfully processed {successful_count}/{len(branch_dirs)} branches")
+        print(f"-> Total inserted/updated {total_inserted} hydrotable records.")
+
+        # Process REM rasters
+        print("\nProcessing and inserting REM rasters...")
+
+        rem_insert_sql = f"""
+        INSERT INTO HAND_REM_Rasters (rem_raster_id, catchment_id, hand_version_id, raster_path, metadata)
+        SELECT
+            uuid() AS rem_raster_id,
+            c.catchment_id,
+            '{hand_version}' AS hand_version_id,
+            rem_files.file AS raster_path,
+            json_object('branch_dir', regexp_extract(rem_files.file, '(.*/branches/[^/]+/)')) AS metadata
+        FROM (SELECT file FROM glob('{rem_glob}')) AS rem_files
+        JOIN Catchments c ON c.branch_path = regexp_extract(rem_files.file, '(.*/branches/[^/]+/)')
+        ON CONFLICT (rem_raster_id) DO NOTHING;
+        """
+
+        result = conn.execute(rem_insert_sql)
+        rem_count = result.rowcount if hasattr(result, "rowcount") else 0
+        print(f"-> Inserted {rem_count} REM raster records.")
+
+        # Process catchment rasters
+        print("\nProcessing and inserting catchment rasters...")
+
+        catch_insert_sql = f"""
+        INSERT INTO HAND_Catchment_Rasters (catchment_raster_id, rem_raster_id, raster_path, metadata)
+        SELECT
+            uuid() AS catchment_raster_id,
+            r.rem_raster_id,
+            catch_files.file AS raster_path,
+            json_object('branch_dir', regexp_extract(catch_files.file, '(.*/branches/[^/]+/)')) AS metadata
+        FROM (SELECT file FROM glob('{catch_glob}')) AS catch_files
+        JOIN HAND_REM_Rasters r ON json_extract_string(r.metadata, '$.branch_dir') = regexp_extract(catch_files.file, '(.*/branches/[^/]+/)')
+        ON CONFLICT (catchment_raster_id) DO NOTHING;
+        """
+
+        result = conn.execute(catch_insert_sql)
+        catch_count = result.rowcount if hasattr(result, "rowcount") else 0
+        print(f"-> Inserted {catch_count} catchment raster records.")
+
+    except Exception as e:
+        print(f"\nFATAL ERROR during data ingestion: {e}")
+        raise
+    finally:
+        conn.close()
+        print(f"--- Ingestion Finished in {time.time() - start_time:.2f} seconds ---")
 
 
-def partition_tables_to_parquet(db_path: str, output_dir: str, h3_resolution: int = 1):
-    """Partition tables from DuckDB to parquet files using H3 spatial indexing."""
-    with get_database_connection(db_path) as conn:
-        print("Loading DuckDB extensions...")
-        load_extensions(conn, ["httpfs", "aws", "spatial", "h3"])
-
-        if output_dir.startswith("s3://"):
-            print("Configuring AWS settings for S3 access...")
-            try:
-                conn.execute("SET s3_region='us-east-1';")
-            except Exception as e:
-                print(f"Warning: Could not configure AWS settings: {e}")
-
-        # Create indexes
-        for idx_sql in [
-            "CREATE INDEX IF NOT EXISTS catchments_geom_idx ON catchments USING RTREE (geometry);",
-            "CREATE INDEX IF NOT EXISTS idx_hydro_catchment_id ON hydrotables (catchment_id);",
-            "CREATE INDEX IF NOT EXISTS idx_hrr_catchment_id ON hand_rem_rasters (catchment_id);",
-            "CREATE INDEX IF NOT EXISTS idx_hcr_rem_raster_id ON hand_catchment_rasters (rem_raster_id);",
-        ]:
-            try:
-                conn.execute(idx_sql)
-            except:
-                pass
-
-        conn.execute(f"SET VARIABLE h3_resolution = {h3_resolution};")
+def partition_tables_to_parquet(db_path: str, output_dir: str):
+    """Exports tables from DuckDB to a partitioned Parquet dataset."""
+    print(f"\n--- Starting Parquet Export to {output_dir} ---")
+    with duckdb.connect(db_path, read_only=True) as conn:
+        print("Loading extensions for S3 export (httpfs, aws)...")
+        conn.execute("INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;")
         output_dir = output_dir.rstrip("/") + "/"
 
-        # Common H3 calculation
-        h3_calc = """h3_latlng_to_cell(
-            ST_Y(ST_Transform(ST_Centroid(c.geometry), 'EPSG:5070', 'EPSG:4326', true)),
-            ST_X(ST_Transform(ST_Centroid(c.geometry), 'EPSG:5070', 'EPSG:4326', true)),
-            getvariable('h3_resolution')
-        )"""
-
-        # Partition catchments
-        print("Partitioning catchments table...")
-        conn.execute(f"""
-            COPY (SELECT c.*, {h3_calc} AS h3_partition_key FROM catchments c)
-            TO '{output_dir}catchments/'
-            WITH (FORMAT PARQUET, PARTITION_BY (h3_partition_key), OVERWRITE_OR_IGNORE 1);
-        """)
-
-        # Create temp mapping table
-        print("Creating catchment H3 mapping...")
-        conn.execute(f"""
-            CREATE TEMP TABLE catchment_h3_map AS
-            SELECT catchment_id, {h3_calc} AS h3_partition_key FROM catchments c;
-        """)
-
-        # Partition hydrotables
-        print("Partitioning hydrotables...")
-        conn.execute(f"""
-            COPY (
-                SELECT ht.*, chm.h3_partition_key
-                FROM hydrotables ht
-                JOIN catchment_h3_map chm ON ht.catchment_id = chm.catchment_id
-            ) TO '{output_dir}hydrotables/'
-            WITH (FORMAT PARQUET, PARTITION_BY (h3_partition_key), OVERWRITE_OR_IGNORE 1);
-        """)
-
-        # Export non-partitioned tables
-        for table, name in [
-            ("hand_rem_rasters", "HAND REM rasters"),
-            ("hand_catchment_rasters", "HAND catchment rasters"),
-        ]:
-            print(f"Exporting {name} (unpartitioned)...")
+        # Export partitioned tables
+        partitioned_tables = ["Catchments", "Hydrotables"]
+        for table in partitioned_tables:
+            start_time = time.time()
+            partition_path = f"{output_dir}{table.lower()}/"
+            print(f"  Exporting '{table}' to '{partition_path}' (partitioned by h3_index)...")
             conn.execute(f"""
-                COPY {table} TO '{output_dir}{table}.parquet'
+                COPY (SELECT * FROM {table} WHERE h3_index IS NOT NULL)
+                TO '{partition_path}'
+                WITH (FORMAT PARQUET, PARTITION_BY (h3_index), OVERWRITE_OR_IGNORE 1);
+            """)
+            print(f"  -> Finished '{table}' in {time.time() - start_time:.2f} seconds.")
+
+        # Export non-partitioned raster tables as single files
+        single_file_tables = ["HAND_REM_Rasters", "HAND_Catchment_Rasters"]
+        for table in single_file_tables:
+            start_time = time.time()
+            file_path = f"{output_dir}{table.lower()}.parquet"
+            print(f"  Exporting '{table}' to '{file_path}' (single file)...")
+            conn.execute(f"""
+                COPY {table}
+                TO '{file_path}'
                 WITH (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1);
             """)
+            print(f"  -> Finished '{table}' in {time.time() - start_time:.2f} seconds.")
 
-    print(f"Tables partitioned successfully to: {output_dir}")
+    print(f"\n--- Data successfully exported to: {output_dir} ---")
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--db-path", required=True, help="Path to DuckDB database file")
-    p.add_argument("--schema-path", default="./schema/hand-index-v0.1.sql", help="Path to DuckDB schema SQL file")
-    p.add_argument("--hand-dir", required=True, help="Root of your HAND HUC8 tree (local path or s3://...)")
-    p.add_argument("--hand-version", required=True, help="A text id for this HAND run")
-    p.add_argument("--nwm-version", required=True, help="NWM version (decimal)")
-    p.add_argument("--init-db", action="store_true", help="Initialize database with schema")
-    p.add_argument("--output-dir", help="Output directory for partitioned parquet files")
-    p.add_argument("--skip-load", action="store_true", help="Skip loading data, only partition existing database")
-    p.add_argument("--h3-resolution", type=int, default=1, help="H3 resolution for spatial partitioning (default: 1)")
-    p.add_argument("--batch-size", type=int, default=1000, help="Number of branches per batch (default: 1000)")
+    p = argparse.ArgumentParser(description="HAND data loader and exporter for DuckDB.")
+    p.add_argument("--db-path", required=True)
     p.add_argument(
-        "--calb",
-        action="store_true",
-        help="Use calibrated HAND version (look for hydrotables at HUC level)",
+        "--schema-path",
+        default="./schema/hand-index-ver-fim100-uncalb.sql",
+        help="Path to SQL schema file (default: ./schema/hand-index-ver-fim100-uncalb.sql)",
     )
+    p.add_argument("--hand-dir", required=True)
+    p.add_argument("--hand-version", required=True)
+    p.add_argument("--nwm-version", required=True)
+    p.add_argument("--h3-resolution", type=int, default=1)
+    p.add_argument("--calb", action="store_true")
+    p.add_argument("--skip-load", action="store_true")
+    p.add_argument("--batch-size", type=int, default=300, help="Batch size for processing files")
+    p.add_argument("--output-dir", help="If provided, export tables to this S3 or local directory.")
     args = p.parse_args()
-
-    db_exists = os.path.exists(args.db_path)
-
-    if args.init_db and db_exists:
-        print(f"Error: Database {args.db_path} already exists. Cannot initialize existing database.")
-        exit(1)
 
     # Validate output directory
     if args.output_dir:
@@ -579,24 +383,35 @@ def main():
                 print(f"Error: Could not create output directory: {e}")
                 exit(1)
 
-    if args.init_db:
-        initialize_database(args.db_path, args.schema_path)
+    # Check if database already exists unless we're skipping load
+    if not args.skip_load:
+        if os.path.exists(args.db_path):
+            print(
+                f"Error: Database file already exists at {args.db_path}. Remove it or use --skip-load to work with existing database."
+            )
+            return
+        # Initialize new database with schema
+        with duckdb.connect(args.db_path) as conn:
+            with open(args.schema_path, "r") as f:
+                schema_sql = f.read()
+                conn.execute(schema_sql)
+        print(f"Database initialized at '{args.db_path}' using schema '{args.schema_path}'.")
 
-    if not args.skip_load or not db_exists:
-        if args.skip_load and not db_exists:
-            print(f"Warning: --skip-load specified but database doesn't exist. Loading data...")
+    if not args.skip_load:
         load_hand_suite(
-            args.db_path, args.hand_dir, args.hand_version, Decimal(args.nwm_version), args.batch_size, args.calb
+            db_path=args.db_path,
+            hand_dir=args.hand_dir,
+            hand_version=args.hand_version,
+            nwm_version=str(Decimal(args.nwm_version)),
+            h3_resolution=args.h3_resolution,
+            calb=args.calb,
+            batch_size=args.batch_size,
         )
-        print(f"\nData loaded into {args.db_path}")
-    else:
-        print(f"Skipping data load, using existing database: {args.db_path}")
 
     if args.output_dir:
-        print(f"\nPartitioning tables to: {args.output_dir}")
-        partition_tables_to_parquet(args.db_path, args.output_dir, args.h3_resolution)
+        partition_tables_to_parquet(args.db_path, args.output_dir)
 
-    print(f"\nDONE.")
+    print("\nWorkflow Complete.")
 
 
 if __name__ == "__main__":

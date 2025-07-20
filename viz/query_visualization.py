@@ -93,7 +93,7 @@ def get_all_intersecting_catchments(
     # Get geometries and attributes (unfiltered)
     geoms, attrs, query_poly_5070 = (
         get_catchment_data_for_geojson_poly_split_partitioned(
-            geojson_path, con, h3_resolution
+            geojson_path, con
         )
     )
 
@@ -144,10 +144,10 @@ def get_all_catchments_in_region(
     sql = f"""
     SELECT 
         c.catchment_id,
-        ST_AsWKB(c.geometry) AS geom_wkb
+        c.geometry AS geom_wkt
     FROM catchments_partitioned c
     WHERE ST_Intersects(
-        c.geometry,
+        ST_GeomFromText(c.geometry),
         ST_Transform(
             ST_MakeEnvelope({buffered_bounds[0]}, {buffered_bounds[1]}, {buffered_bounds[2]}, {buffered_bounds[3]}),
             'EPSG:4326', 'EPSG:5070', TRUE
@@ -163,13 +163,11 @@ def get_all_catchments_in_region(
             columns=["catchment_id", "geometry"], geometry="geometry", crs="EPSG:5070"
         )
 
-    # Decode WKB → shapely geometries
-    wkb_series = result["geom_wkb"].apply(
-        lambda x: bytes(x) if isinstance(x, bytearray) else x
-    )
+    # Convert WKT → shapely geometries
+    wkt_series = result["geom_wkt"]
     all_catchments_gdf = gpd.GeoDataFrame(
         result[["catchment_id"]],
-        geometry=gpd.GeoSeries.from_wkb(wkb_series, crs="EPSG:5070"),
+        geometry=gpd.GeoSeries.from_wkt(wkt_series, crs="EPSG:5070"),
         crs="EPSG:5070",
     )
 
