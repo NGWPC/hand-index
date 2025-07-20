@@ -58,23 +58,17 @@ CREATE TABLE Hydrotables (
 );
 
 CREATE TABLE HAND_REM_Rasters (
-    rem_raster_id UUID PRIMARY KEY,
     catchment_id UUID REFERENCES Catchments(catchment_id),
-    hand_version_id TEXT,
     raster_path TEXT,
-    metadata JSON
 );
 
 CREATE TABLE HAND_Catchment_Rasters (
-    catchment_raster_id UUID PRIMARY KEY,
-    rem_raster_id UUID REFERENCES HAND_REM_Rasters(rem_raster_id),
+    catchment_id UUID REFERENCES Catchments(catchment_id),
     raster_path TEXT,
-    metadata JSON
 );
 
 -- Create indexes
 CREATE INDEX idx_hydrotables_nwm_feature ON Hydrotables(feature_id, nwm_version_id);
 CREATE INDEX idx_hydrotables_catchment ON Hydrotables(catchment_id);
-CREATE INDEX idx_rem_rasters_catchment ON HAND_REM_Rasters(catchment_id);
-CREATE INDEX idx_catchment_rasters_rem ON HAND_Catchment_Rasters(rem_raster_id);
+-- Indexes on catchment_id are covered by the primary key
 CREATE INDEX idx_catchments_branch_path ON Catchments(branch_path);

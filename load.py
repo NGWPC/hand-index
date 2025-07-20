@@ -58,6 +58,10 @@ def load_hand_suite(
 
         print("Processing and inserting Catchment geometries...")
 
+        # Create staging table for Catchments
+        print("Creating staging table for Catchments...")
+        conn.execute("CREATE TEMP TABLE Catchments_Staging AS SELECT * FROM Catchments LIMIT 0;")
+
         # First get the list of files, then build a dynamic query
         file_list_query = f"SELECT file FROM glob('{gpkg_glob}')"
         files = conn.execute(file_list_query).fetchall()
@@ -141,7 +145,7 @@ def load_hand_suite(
                     )
 
                 batch_insert_sql = f"""
-                INSERT INTO Catchments (catchment_id, hand_version_id, geometry, h3_index, branch_path)
+                INSERT INTO Catchments_Staging (catchment_id, hand_version_id, geometry, h3_index, branch_path)
                 WITH all_geoms AS (
                     {' UNION ALL '.join(file_reads)}
                 ),
@@ -186,7 +190,21 @@ def load_hand_suite(
 
                 shutil.rmtree(temp_dir)
 
-        print(f"-> Total inserted/updated {total_inserted} catchment records.")
+        print(f"-> Total inserted into staging table: {total_inserted} catchment records.")
+
+        # Perform bulk insert from staging to final table
+        print("\nPerforming bulk insert from staging to Catchments table...")
+        result = conn.execute("""
+            INSERT INTO Catchments 
+            SELECT * FROM Catchments_Staging 
+            ON CONFLICT (catchment_id) DO NOTHING;
+        """)
+        final_count = result.rowcount if hasattr(result, "rowcount") else 0
+        print(f"-> Final inserted: {final_count} catchment records.")
+
+        # Clean up staging table
+        print("Cleaning up Catchments staging table...")
+        conn.execute("DROP TABLE Catchments_Staging;")
 
         # Loading entire catchments table first for data integrity. Catchments must exist before Hydrotables can reference them.
 
@@ -287,15 +305,13 @@ def load_hand_suite(
         print("\nProcessing and inserting REM rasters...")
 
         rem_insert_sql = f"""
-        INSERT INTO HAND_REM_Rasters (rem_raster_id, catchment_id, hand_version_id, raster_path)
+        INSERT INTO HAND_REM_Rasters (catchment_id, raster_path)
         SELECT
-            uuid() AS rem_raster_id,
             c.catchment_id,
-            '{hand_version}' AS hand_version_id,
             rem_files.file AS raster_path
         FROM (SELECT file FROM glob('{rem_glob}')) AS rem_files
         JOIN Catchments c ON c.branch_path = regexp_extract(rem_files.file, '(.*/branches/[^/]+/)')
-        ON CONFLICT (rem_raster_id) DO NOTHING;
+        ON CONFLICT (catchment_id, raster_path) DO NOTHING;
         """
 
         result = conn.execute(rem_insert_sql)
@@ -306,17 +322,13 @@ def load_hand_suite(
         print("\nProcessing and inserting catchment rasters...")
 
         catch_insert_sql = f"""
-        INSERT INTO HAND_Catchment_Rasters (catchment_raster_id, rem_raster_id, raster_path)
+        INSERT INTO HAND_Catchment_Rasters (catchment_id, raster_path)
         SELECT
-            uuid() AS catchment_raster_id,
-            r.rem_raster_id,
+            c.catchment_id,
             catch_files.file AS raster_path
         FROM (SELECT file FROM glob('{catch_glob}')) AS catch_files
-        JOIN HAND_REM_Rasters r ON r.catchment_id IN (
-            SELECT catchment_id FROM Catchments c 
-            WHERE c.branch_path = regexp_extract(catch_files.file, '(.*/branches/[^/]+/)')
-        )
-        ON CONFLICT (catchment_raster_id) DO NOTHING;
+        JOIN Catchments c ON c.branch_path = regexp_extract(catch_files.file, '(.*/branches/[^/]+/)')
+        ON CONFLICT (catchment_id, raster_path) DO NOTHING;
         """
 
         result = conn.execute(catch_insert_sql)
