@@ -132,19 +132,25 @@ def load_hand_suite(
                 # Build UNION ALL query for this batch
                 union_parts = []
                 for branch_dir, _, local_path in batch:
-                    union_parts.append(f"""
-                    SELECT 
+                    single_file_query = f"""
+                    SELECT
                         uuid() AS catchment_id,
                         '{hand_version}' AS hand_version_id,
                         ST_AsText(ST_Force2D(geom)) AS geometry,
                         h3_latlng_to_cell(
-                            ST_Y(ST_Transform(ST_Centroid(geom), 'EPSG:5070', 'EPSG:4326', true)),
-                            ST_X(ST_Transform(ST_Centroid(geom), 'EPSG:5070', 'EPSG:4326', true)),
+                            ST_Y(transformed_centroid),
+                            ST_X(transformed_centroid),
                             {h3_resolution}
                         ) AS h3_index,
                         '{branch_dir}' AS branch_path
-                    FROM ST_Read('{local_path}')
-                    """)
+                    FROM (
+                        SELECT
+                            geom,
+                            ST_Transform(ST_Centroid(geom), 'EPSG:5070', 'EPSG:4326', true) AS transformed_centroid
+                        FROM ST_Read('{local_path.replace("'", "''")}') -- Escape single quotes in path
+                    ) AS processed_geoms
+                    """
+                    union_parts.append(single_file_query)
 
                 batch_insert_sql = f"""
                 INSERT INTO Catchments (catchment_id, hand_version_id, geometry, h3_index, branch_path)
@@ -355,7 +361,7 @@ def main():
     p.add_argument("--h3-resolution", type=int, default=1)
     p.add_argument("--calb", action="store_true")
     p.add_argument("--skip-load", action="store_true")
-    p.add_argument("--batch-size", type=int, default=300, help="Batch size for processing files")
+    p.add_argument("--batch-size", type=int, default=100, help="Batch size for processing files")
     p.add_argument("--output-dir", help="If provided, export tables to this S3 or local directory.")
     args = p.parse_args()
 
