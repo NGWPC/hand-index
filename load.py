@@ -88,7 +88,6 @@ def load_hand_suite(
 
         # Process files in batches
         branch_files = list(branch_to_file.items())
-        total_inserted = 0
 
         # Initialize S3 filesystem for parallel downloads if needed
         fs = s3fs.S3FileSystem() if hand_dir.startswith("s3://") else None
@@ -130,7 +129,6 @@ def load_hand_suite(
 
             # Process each file individually - directly insert all geometries from GPKG
             print(f"Processing {len(local_file_paths)} files...")
-            batch_inserted = 0
 
             # Batch files to reduce round trips while avoiding single giant query
             for i in range(0, len(local_file_paths), batch_size):
@@ -176,21 +174,17 @@ def load_hand_suite(
                 try:
                     result = conn.execute(batch_insert_sql)
                     records_inserted = result.rowcount if hasattr(result, "rowcount") else len(batch)
-                    batch_inserted += records_inserted
                 except Exception as e:
                     print(f"Error processing batch starting at index {i}: {e}")
                     continue
 
-            total_inserted += batch_inserted
-            print(f"-> Batch inserted {batch_inserted} catchment records.")
+            print(f"-> Batch inserted catchment records.")
 
             # Clean up temporary files
             if temp_dir and os.path.exists(temp_dir):
                 import shutil
 
                 shutil.rmtree(temp_dir)
-
-        print(f"-> Total inserted into staging table: {total_inserted} catchment records.")
 
         # Perform bulk insert from staging to final table
         print("\nPerforming bulk insert from staging to Catchments table...")
@@ -240,8 +234,6 @@ def load_hand_suite(
         print(f"Found {len(csv_files)} CSV files to process")
 
         # Process CSVs in batches using the provided batch_size parameter
-        total_inserted = 0
-
         for i in range(0, len(csv_files), batch_size):
             batch_files = csv_files[i : i + batch_size]
             batch_num = i // batch_size + 1
@@ -278,14 +270,11 @@ def load_hand_suite(
             try:
                 result = conn.execute(hydrotable_insert_sql)
                 rowcount = result.rowcount if hasattr(result, "rowcount") else 0
-                total_inserted += rowcount
                 print(f"  -> Batch {batch_num} inserted.")
             except Exception as e:
                 print(f"  -> Error in batch {batch_num}: {e}")
                 # Continue with next batch instead of failing completely
                 continue
-
-        print(f"-> Total inserted into staging table: {total_inserted} hydrotable records.")
 
         # Perform bulk insert from staging to final table
         print("\nPerforming bulk insert from staging to Hydrotables table...")
