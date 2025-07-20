@@ -71,7 +71,7 @@ def _partitioned_query_cte(wkt4326: str) -> str:
         c.geometry,
         c.h3_index
       FROM catchments_partitioned c
-      JOIN transformed_query tq ON ST_Intersects(ST_GeomFromText(c.geometry), tq.query_geom)
+      JOIN transformed_query tq ON ST_Intersects(ST_GeomFromWKB(c.geometry), tq.query_geom)
     )
     """
 
@@ -114,7 +114,7 @@ def get_catchment_data_for_geojson_poly_split_partitioned(
         + """
     SELECT
       fc.catchment_id,
-      fc.geometry AS geom_wkt
+      ST_GeomFromWKB(fc.geometry) AS geom_wkb
     FROM filtered_catchments AS fc;
     """
     )
@@ -124,12 +124,10 @@ def get_catchment_data_for_geojson_poly_split_partitioned(
         empty_gdf = gpd.GeoDataFrame(columns=["catchment_id", "geometry"], geometry="geometry", crs="EPSG:5070")
         return empty_gdf, pd.DataFrame(), query_poly_5070
 
-    # Convert WKT → shapely geometries
-    from shapely import wkt
-    wkt_series = geom_df["geom_wkt"]
+    # Direct use - DuckDB already converted WKB to GEOMETRY objects
     geometries_gdf = gpd.GeoDataFrame(
-        geom_df[["catchment_id"]],
-        geometry=gpd.GeoSeries.from_wkt(wkt_series, crs="EPSG:5070"),
+        geom_df[["catchment_id", "geom_wkb"]].rename(columns={"geom_wkb": "geometry"}),
+        geometry="geometry",
         crs="EPSG:5070",
     )
 

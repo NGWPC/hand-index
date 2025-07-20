@@ -161,7 +161,7 @@ def load_hand_suite(
                 SELECT
                     uuid() AS catchment_id,
                     '{hand_version}' AS hand_version_id,
-                    ST_AsText(ST_Force2D(merged_geom)) AS geometry,
+                    ST_AsWKB(ST_Force2D(merged_geom)) AS geometry,
                     h3_latlng_to_cell(
                         ST_Y(ST_Transform(ST_Centroid(merged_geom), 'EPSG:5070', 'EPSG:4326', true)),
                         ST_X(ST_Transform(ST_Centroid(merged_geom), 'EPSG:5070', 'EPSG:4326', true)),
@@ -310,8 +310,7 @@ def load_hand_suite(
             c.catchment_id,
             rem_files.file AS raster_path
         FROM (SELECT file FROM glob('{rem_glob}')) AS rem_files
-        JOIN Catchments c ON c.branch_path = regexp_extract(rem_files.file, '(.*/branches/[^/]+/)')
-        ON CONFLICT (catchment_id, raster_path) DO NOTHING;
+        JOIN Catchments c ON c.branch_path = regexp_extract(rem_files.file, '(.*/branches/[^/]+/)');
         """
 
         result = conn.execute(rem_insert_sql)
@@ -327,8 +326,7 @@ def load_hand_suite(
             c.catchment_id,
             catch_files.file AS raster_path
         FROM (SELECT file FROM glob('{catch_glob}')) AS catch_files
-        JOIN Catchments c ON c.branch_path = regexp_extract(catch_files.file, '(.*/branches/[^/]+/)')
-        ON CONFLICT (catchment_id, raster_path) DO NOTHING;
+        JOIN Catchments c ON c.branch_path = regexp_extract(catch_files.file, '(.*/branches/[^/]+/)');
         """
 
         result = conn.execute(catch_insert_sql)

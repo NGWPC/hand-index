@@ -5,7 +5,7 @@ LOAD spatial;
 CREATE TABLE Catchments (
     catchment_id UUID PRIMARY KEY,
     hand_version_id TEXT, 
-    geometry VARCHAR, -- storing geometry as WKT
+    geometry BLOB, -- storing geometry as WKB
     h3_index BIGINT,
     branch_path TEXT
 );
