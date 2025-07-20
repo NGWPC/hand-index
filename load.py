@@ -188,13 +188,13 @@ def load_hand_suite(
 
         # Perform bulk insert from staging to final table
         print("\nPerforming bulk insert from staging to Catchments table...")
-        result = conn.execute("""
+        conn.execute("""
             INSERT INTO Catchments 
             SELECT * FROM Catchments_Staging 
             ON CONFLICT (catchment_id) DO NOTHING;
         """)
-        final_count = result.rowcount if hasattr(result, "rowcount") else 0
-        print(f"-> Final inserted: {final_count} catchment records.")
+        final_count = conn.execute("SELECT COUNT(*) FROM Catchments").fetchone()[0]
+        print(f"-> Total catchment records in table: {final_count}")
 
         # Clean up staging table
         print("Cleaning up Catchments staging table...")
@@ -278,13 +278,13 @@ def load_hand_suite(
 
         # Perform bulk insert from staging to final table
         print("\nPerforming bulk insert from staging to Hydrotables table...")
-        result = conn.execute("""
+        conn.execute("""
             INSERT INTO Hydrotables 
             SELECT * FROM Hydrotables_Staging 
             ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING;
         """)
-        final_count = result.rowcount if hasattr(result, "rowcount") else 0
-        print(f"-> Final inserted: {final_count} hydrotable records.")
+        final_count = conn.execute("SELECT COUNT(*) FROM Hydrotables").fetchone()[0]
+        print(f"-> Total hydrotable records in table: {final_count}")
 
         # Clean up staging table
         print("Cleaning up staging table...")
@@ -302,9 +302,9 @@ def load_hand_suite(
         JOIN Catchments c ON c.branch_path = regexp_extract(rem_files.file, '(.*/branches/[^/]+/)');
         """
 
-        result = conn.execute(rem_insert_sql)
-        rem_count = result.rowcount if hasattr(result, "rowcount") else 0
-        print(f"-> Inserted {rem_count} REM raster records.")
+        conn.execute(rem_insert_sql)
+        rem_count = conn.execute("SELECT COUNT(*) FROM HAND_REM_Rasters").fetchone()[0]
+        print(f"-> Total REM raster records in table: {rem_count}")
 
         # Process catchment rasters
         print("\nProcessing and inserting catchment rasters...")
@@ -318,9 +318,9 @@ def load_hand_suite(
         JOIN Catchments c ON c.branch_path = regexp_extract(catch_files.file, '(.*/branches/[^/]+/)');
         """
 
-        result = conn.execute(catch_insert_sql)
-        catch_count = result.rowcount if hasattr(result, "rowcount") else 0
-        print(f"-> Inserted {catch_count} catchment raster records.")
+        conn.execute(catch_insert_sql)
+        catch_count = conn.execute("SELECT COUNT(*) FROM HAND_Catchment_Rasters").fetchone()[0]
+        print(f"-> Total catchment raster records in table: {catch_count}")
 
     except Exception as e:
         print(f"\nFATAL ERROR during data ingestion: {e}")
