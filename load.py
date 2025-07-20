@@ -58,7 +58,7 @@ def load_hand_suite(
 
         print("Processing and inserting Catchment geometries...")
 
-        # Create staging table for Catchments
+        # Create staging table for Catchments. This staging approach improves performance because it allows us to insert data without the database checking constraints on every insert
         print("Creating staging table for Catchments...")
         conn.execute("CREATE TEMP TABLE Catchments_Staging AS SELECT * FROM Catchments LIMIT 0;")
 
