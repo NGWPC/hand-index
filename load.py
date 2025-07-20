@@ -144,6 +144,7 @@ def load_hand_suite(
                     SELECT 
                         branch_path,
                         COUNT(*) AS geom_count,
+                        -- 100 sets a 100 m tolerance in EPSG:5070
                         ST_Simplify(ST_Union_Agg(geom), 100) AS merged_geom
                     FROM all_geoms
                     GROUP BY branch_path
