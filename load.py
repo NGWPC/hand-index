@@ -366,7 +366,12 @@ def main():
     p.add_argument("--h3-resolution", type=int, default=1)
     p.add_argument("--calb", action="store_true")
     p.add_argument("--skip-load", action="store_true")
-    p.add_argument("--batch-size", type=int, default=100, help="Batch size for processing files")
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=10,
+        help="Batch size for processing files. The larger the tables that will be created the smaller this needs to be to avoid running out of memory while running the queries.",
+    )
     p.add_argument("--output-dir", help="If provided, export tables to this S3 or local directory.")
     args = p.parse_args()
 
