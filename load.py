@@ -1,5 +1,4 @@
 import argparse
-import gc
 import os
 import tempfile
 import time
@@ -50,6 +49,12 @@ def load_hand_suite(
         conn.execute("INSTALL httpfs; LOAD httpfs; INSTALL spatial; LOAD spatial;")
         conn.execute("INSTALL h3 FROM community; LOAD h3;")
         conn.execute("INSTALL aws; LOAD aws;")
+
+        # Configure memory management and spilling
+        print("Configuring memory management...")
+        conn.execute("SET memory_limit = '25GB';")
+        conn.execute("SET temp_directory = '/tmp';")
+        conn.execute("SET preserve_insertion_order = false;")
 
         print("Processing and inserting Catchment geometries...")
 
@@ -161,7 +166,7 @@ def load_hand_suite(
                     branch_path
                 FROM merged_geoms
                 WHERE merged_geom IS NOT NULL
-                ON CONFLICT (catchment_id) DO NOTHING;
+                ;
                 """
 
                 try:
@@ -171,11 +176,6 @@ def load_hand_suite(
                 except Exception as e:
                     print(f"Error processing batch starting at index {i}: {e}")
                     continue
-
-                # clean up any intermediate/cached results. Reconnecting to duckdb resets its memory usage
-                conn.close()
-                conn = duckdb.connect(db_path)
-                conn.execute("LOAD httpfs; LOAD spatial; LOAD h3; LOAD aws;")
 
             total_inserted += batch_inserted
             print(f"-> Batch inserted {batch_inserted} catchment records.")
@@ -191,6 +191,11 @@ def load_hand_suite(
         # Loading entire catchments table first for data integrity. Catchments must exist before Hydrotables can reference them.
 
         print("\nProcessing and inserting HydroTable data (with h3_index)...")
+
+        # Create staging table for Hydrotables
+        print("Creating staging table for Hydrotables...")
+        conn.execute("CREATE TEMP TABLE Hydrotables_Staging AS SELECT * FROM Hydrotables LIMIT 0;")
+
         csv_dir_extractor = f"regexp_extract(filename, '(.*/{'branches/[^/]+/' if not calb else '[^/]+/'})')"
 
         # Build dynamic aggregation SQL using DuckDB metadata. Doing it this way so that this script doesn't need to have any knowledge of the columns in the hydrotable.csv's. As long as the hydrotables schema has the correct numeric and numeric array types and the same column names as the csv's you are ingesting then the code is able to figure out which columns in hydrotable csv need to be aggregated to arrays and which columns to leave as scalars. Aggregation is by HydroID
@@ -237,7 +242,7 @@ def load_hand_suite(
             WITH raw_csv_data AS (
                 {file_unions}
             )
-            INSERT INTO Hydrotables
+            INSERT INTO Hydrotables_Staging
             SELECT
                 c.catchment_id,
                 '{hand_version}' as hand_version_id,
@@ -249,7 +254,7 @@ def load_hand_suite(
             JOIN Catchments c ON c.branch_path = raw_csv_data.csv_dir
             WHERE "HydroID" IS NOT NULL AND "HydroID" != ''
             GROUP BY c.catchment_id, raw_csv_data.HydroID
-            ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING;
+            ;
             """
 
             try:
@@ -262,24 +267,32 @@ def load_hand_suite(
                 # Continue with next batch instead of failing completely
                 continue
 
-            # clean up any intermediate/cached results. Reconnecting to duckdb resets its memory usage
-            conn.close()
-            conn = duckdb.connect(db_path)
-            conn.execute("LOAD httpfs; LOAD spatial; LOAD h3; LOAD aws;")
+        print(f"-> Total inserted into staging table: {total_inserted} hydrotable records.")
 
-        print(f"-> Total inserted/updated {total_inserted} hydrotable records.")
+        # Perform bulk insert from staging to final table
+        print("\nPerforming bulk insert from staging to Hydrotables table...")
+        result = conn.execute("""
+            INSERT INTO Hydrotables 
+            SELECT * FROM Hydrotables_Staging 
+            ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING;
+        """)
+        final_count = result.rowcount if hasattr(result, "rowcount") else 0
+        print(f"-> Final inserted: {final_count} hydrotable records.")
+
+        # Clean up staging table
+        print("Cleaning up staging table...")
+        conn.execute("DROP TABLE Hydrotables_Staging;")
 
         # Process REM rasters
         print("\nProcessing and inserting REM rasters...")
 
         rem_insert_sql = f"""
-        INSERT INTO HAND_REM_Rasters (rem_raster_id, catchment_id, hand_version_id, raster_path, metadata)
+        INSERT INTO HAND_REM_Rasters (rem_raster_id, catchment_id, hand_version_id, raster_path)
         SELECT
             uuid() AS rem_raster_id,
             c.catchment_id,
             '{hand_version}' AS hand_version_id,
-            rem_files.file AS raster_path,
-            json_object('branch_dir', regexp_extract(rem_files.file, '(.*/branches/[^/]+/)')) AS metadata
+            rem_files.file AS raster_path
         FROM (SELECT file FROM glob('{rem_glob}')) AS rem_files
         JOIN Catchments c ON c.branch_path = regexp_extract(rem_files.file, '(.*/branches/[^/]+/)')
         ON CONFLICT (rem_raster_id) DO NOTHING;
@@ -293,14 +306,16 @@ def load_hand_suite(
         print("\nProcessing and inserting catchment rasters...")
 
         catch_insert_sql = f"""
-        INSERT INTO HAND_Catchment_Rasters (catchment_raster_id, rem_raster_id, raster_path, metadata)
+        INSERT INTO HAND_Catchment_Rasters (catchment_raster_id, rem_raster_id, raster_path)
         SELECT
             uuid() AS catchment_raster_id,
             r.rem_raster_id,
-            catch_files.file AS raster_path,
-            json_object('branch_dir', regexp_extract(catch_files.file, '(.*/branches/[^/]+/)')) AS metadata
+            catch_files.file AS raster_path
         FROM (SELECT file FROM glob('{catch_glob}')) AS catch_files
-        JOIN HAND_REM_Rasters r ON json_extract_string(r.metadata, '$.branch_dir') = regexp_extract(catch_files.file, '(.*/branches/[^/]+/)')
+        JOIN HAND_REM_Rasters r ON r.catchment_id IN (
+            SELECT catchment_id FROM Catchments c 
+            WHERE c.branch_path = regexp_extract(catch_files.file, '(.*/branches/[^/]+/)')
+        )
         ON CONFLICT (catchment_raster_id) DO NOTHING;
         """
 
