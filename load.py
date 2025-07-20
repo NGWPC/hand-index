@@ -144,7 +144,7 @@ def load_hand_suite(
                     SELECT 
                         branch_path,
                         COUNT(*) AS geom_count,
-                        ST_Simplify(ST_Union_Agg(geom), 0.001) AS merged_geom
+                        ST_Simplify(ST_Union_Agg(geom), 100) AS merged_geom
                     FROM all_geoms
                     GROUP BY branch_path
                 )
