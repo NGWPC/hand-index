@@ -129,32 +129,39 @@ def load_hand_suite(
             for i in range(0, len(local_file_paths), batch_size):
                 batch = local_file_paths[i : i + batch_size]
 
-                # Build UNION ALL query for this batch
-                union_parts = []
+                # Build single query with all file reads, then process geometries
+                file_reads = []
                 for branch_dir, _, local_path in batch:
-                    single_file_query = f"""
-                    SELECT
-                        uuid() AS catchment_id,
-                        '{hand_version}' AS hand_version_id,
-                        ST_AsText(ST_Force2D(geom)) AS geometry,
-                        h3_latlng_to_cell(
-                            ST_Y(transformed_centroid),
-                            ST_X(transformed_centroid),
-                            {h3_resolution}
-                        ) AS h3_index,
-                        '{branch_dir}' AS branch_path
-                    FROM (
-                        SELECT
-                            geom,
-                            ST_Transform(ST_Centroid(geom), 'EPSG:5070', 'EPSG:4326', true) AS transformed_centroid
-                        FROM ST_Read('{local_path.replace("'", "''")}') -- Escape single quotes in path
-                    ) AS processed_geoms
-                    """
-                    union_parts.append(single_file_query)
+                    escaped_path = local_path.replace("'", "''")
+                    file_reads.append(
+                        f"SELECT geom, '{branch_dir}' AS branch_path FROM ST_Read('{escaped_path}') WHERE geom IS NOT NULL"
+                    )
 
                 batch_insert_sql = f"""
                 INSERT INTO Catchments (catchment_id, hand_version_id, geometry, h3_index, branch_path)
-                {' UNION ALL '.join(union_parts)}
+                WITH all_geoms AS (
+                    {' UNION ALL '.join(file_reads)}
+                ),
+                merged_geoms AS (
+                    SELECT 
+                        branch_path,
+                        COUNT(*) AS geom_count,
+                        ST_Simplify(ST_Union_Agg(geom), 0.001) AS merged_geom
+                    FROM all_geoms
+                    GROUP BY branch_path
+                )
+                SELECT
+                    uuid() AS catchment_id,
+                    '{hand_version}' AS hand_version_id,
+                    ST_AsText(ST_Force2D(merged_geom)) AS geometry,
+                    h3_latlng_to_cell(
+                        ST_Y(ST_Transform(ST_Centroid(merged_geom), 'EPSG:5070', 'EPSG:4326', true)),
+                        ST_X(ST_Transform(ST_Centroid(merged_geom), 'EPSG:5070', 'EPSG:4326', true)),
+                        {h3_resolution}
+                    ) AS h3_index,
+                    branch_path
+                FROM merged_geoms
+                WHERE merged_geom IS NOT NULL
                 ON CONFLICT (catchment_id) DO NOTHING;
                 """
 
