@@ -51,8 +51,6 @@ def load_hand_suite(
         conn.execute("INSTALL h3 FROM community; LOAD h3;")
         conn.execute("INSTALL aws; LOAD aws;")
 
-        conn.execute("SET preserve_insertion_order=false;")  # Improve performance
-
         print("Processing and inserting Catchment geometries...")
 
         # First get the list of files, then build a dynamic query
