@@ -36,7 +36,9 @@ def load_hand_suite(
     start_time = time.time()
 
     hand_dir = hand_dir.rstrip("/") + "/"
+    # Just uncomment below and delete other base_glob_path when done with trials
     base_glob_path = f"{hand_dir}*/branches/*"
+    # base_glob_path = f"{hand_dir}*12090301*/branches/*"
     gpkg_glob = f"{base_glob_path}/*gw_catchments*.gpkg"
     csv_glob_path = f"{hand_dir}*/" if calb else f"{base_glob_path}/"
     csv_glob = f"{csv_glob_path}hydroTable_*.csv"
@@ -200,6 +202,18 @@ def load_hand_suite(
         print("Cleaning up Catchments staging table...")
         conn.execute("DROP TABLE Catchments_Staging;")
 
+        # Create branch path lookup table for faster joins during CSV processing
+        print("Creating branch path lookup table for optimized CSV processing...")
+        conn.execute("""
+            CREATE TEMP TABLE branch_lookup AS 
+            SELECT DISTINCT catchment_id, branch_path, h3_index 
+            FROM Catchments
+            WHERE branch_path IS NOT NULL;
+        """)
+        conn.execute("CREATE INDEX idx_branch_lookup ON branch_lookup(branch_path);")
+        lookup_count = conn.execute("SELECT COUNT(*) FROM branch_lookup").fetchone()[0]
+        print(f"-> Branch lookup table created with {lookup_count} entries")
+
         # Loading entire catchments table first for data integrity. Catchments must exist before Hydrotables can reference them.
 
         print("\nProcessing and inserting HydroTable data (with h3_index)...")
@@ -261,7 +275,7 @@ def load_hand_suite(
                 FIRST(c.h3_index) as h3_index,
                 {agg_sql}
             FROM raw_csv_data
-            JOIN Catchments c ON c.branch_path = raw_csv_data.csv_dir
+            JOIN branch_lookup c ON c.branch_path = raw_csv_data.csv_dir
             WHERE "HydroID" IS NOT NULL AND "HydroID" != ''
             GROUP BY c.catchment_id, raw_csv_data.HydroID
             ;
