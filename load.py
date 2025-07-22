@@ -225,20 +225,29 @@ def load_hand_suite(
         csv_dir_extractor = f"regexp_extract(filename, '(.*/{'branches/[^/]+/' if not calb else '[^/]+/'})')"
 
         # Build dynamic aggregation SQL using DuckDB metadata. Doing it this way so that this script doesn't need to have any knowledge of the columns in the hydrotable.csv's. As long as the hydrotables schema has the correct numeric and numeric array types and the same column names as the csv's you are ingesting then the code is able to figure out which columns in hydrotable csv need to be aggregated to arrays and which columns to leave as scalars. Aggregation is by HydroID
-        agg_sql = conn.execute("""
-            WITH column_info AS (
-                SELECT column_name, data_type,
-                       CASE 
-                           WHEN data_type LIKE '%[]%' THEN 'ARRAY_AGG(raw_csv_data."' || column_name || '") AS "' || column_name || '"'
-                           ELSE 'FIRST(raw_csv_data."' || column_name || '") AS "' || column_name || '"'
-                       END AS agg_clause
-                FROM information_schema.columns 
-                WHERE table_name = 'Hydrotables' AND table_schema = 'main'
-                AND column_name NOT IN ('catchment_id', 'hand_version_id', 'HydroID', 'nwm_version_id', 'h3_index')
-            )
-            SELECT string_agg(agg_clause, ', ') AS dynamic_agg_clause
-            FROM column_info
-        """).fetchone()[0]
+        
+        # Get column info for building aggregation
+        column_info = conn.execute("""
+            SELECT column_name, data_type
+            FROM information_schema.columns 
+            WHERE table_name = 'Hydrotables' AND table_schema = 'main'
+            AND column_name NOT IN ('catchment_id', 'hand_version_id', 'HydroID', 'nwm_version_id', 'h3_index')
+            ORDER BY ordinal_position
+        """).fetchall()
+        
+        # Build two versions of aggregation SQL - one for pre-aggregation (without table prefix) and one for direct use
+        agg_columns_no_prefix = []
+        select_columns = []
+        
+        for col_name, data_type in column_info:
+            if data_type.endswith('[]'):  # Array type
+                agg_columns_no_prefix.append(f'ARRAY_AGG("{col_name}") AS "{col_name}"')
+            else:  # Scalar type
+                agg_columns_no_prefix.append(f'FIRST("{col_name}") AS "{col_name}"')
+            select_columns.append(f'pre_aggregated."{col_name}"')
+        
+        agg_sql_no_prefix = ", ".join(agg_columns_no_prefix)
+        select_columns_str = ", ".join(select_columns)
 
         # First, get list of all CSV files to process
         print("Discovering CSV files...")
@@ -265,19 +274,26 @@ def load_hand_suite(
             hydrotable_insert_sql = f"""
             WITH raw_csv_data AS (
                 {file_unions}
+            ),
+            pre_aggregated AS (
+                SELECT 
+                    csv_dir,
+                    HydroID,
+                    {agg_sql_no_prefix}
+                FROM raw_csv_data
+                WHERE HydroID IS NOT NULL AND HydroID != ''
+                GROUP BY csv_dir, HydroID
             )
             INSERT INTO Hydrotables_Staging
             SELECT
                 c.catchment_id,
                 '{hand_version}' as hand_version_id,
-                raw_csv_data.HydroID,
+                pre_aggregated.HydroID,
                 '{nwm_version}' as nwm_version_id,
-                FIRST(c.h3_index) as h3_index,
-                {agg_sql}
-            FROM raw_csv_data
-            JOIN branch_lookup c ON c.branch_path = raw_csv_data.csv_dir
-            WHERE "HydroID" IS NOT NULL AND "HydroID" != ''
-            GROUP BY c.catchment_id, raw_csv_data.HydroID
+                c.h3_index,
+                {select_columns_str}
+            FROM pre_aggregated
+            JOIN branch_lookup c ON c.branch_path = pre_aggregated.csv_dir
             ;
             """
 
