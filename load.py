@@ -225,7 +225,7 @@ def load_hand_suite(
         csv_dir_extractor = f"regexp_extract(filename, '(.*/{'branches/[^/]+/' if not calb else '[^/]+/'})')"
 
         # Build dynamic aggregation SQL using DuckDB metadata. Doing it this way so that this script doesn't need to have any knowledge of the columns in the hydrotable.csv's. As long as the hydrotables schema has the correct numeric and numeric array types and the same column names as the csv's you are ingesting then the code is able to figure out which columns in hydrotable csv need to be aggregated to arrays and which columns to leave as scalars. Aggregation is by HydroID
-        
+
         # Get column info for building aggregation
         column_info = conn.execute("""
             SELECT column_name, data_type
@@ -234,18 +234,18 @@ def load_hand_suite(
             AND column_name NOT IN ('catchment_id', 'hand_version_id', 'HydroID', 'nwm_version_id', 'h3_index')
             ORDER BY ordinal_position
         """).fetchall()
-        
+
         # Build two versions of aggregation SQL - one for pre-aggregation (without table prefix) and one for direct use
         agg_columns_no_prefix = []
         select_columns = []
-        
+
         for col_name, data_type in column_info:
-            if data_type.endswith('[]'):  # Array type
+            if data_type.endswith("[]"):  # Array type
                 agg_columns_no_prefix.append(f'ARRAY_AGG("{col_name}") AS "{col_name}"')
             else:  # Scalar type
                 agg_columns_no_prefix.append(f'FIRST("{col_name}") AS "{col_name}"')
             select_columns.append(f'pre_aggregated."{col_name}"')
-        
+
         agg_sql_no_prefix = ", ".join(agg_columns_no_prefix)
         select_columns_str = ", ".join(select_columns)
 
@@ -300,21 +300,33 @@ def load_hand_suite(
             try:
                 result = conn.execute(hydrotable_insert_sql)
                 rowcount = result.rowcount if hasattr(result, "rowcount") else 0
-                print(f"  -> Batch {batch_num} inserted.")
+                print(f"  -> Batch {batch_num} inserted to staging table.")
+
+                # Flush staging table to final table every 1000 batches
+                if batch_num % 1000 == 0 or batch_num == total_batches:
+                    print(f"  -> Flushing staging table to final table (batch {batch_num})...")
+                    flush_result = conn.execute("""
+                        INSERT INTO Hydrotables 
+                        SELECT * FROM Hydrotables_Staging 
+                        ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING;
+                    """)
+                    flush_count = flush_result.rowcount if hasattr(flush_result, "rowcount") else 0
+                    print(f"  -> Flushed {flush_count} records to final table.")
+
+                    # Clear staging table for next batch
+                    conn.execute("TRUNCATE TABLE Hydrotables_Staging;")
+
+                    # Force checkpoint to free memory (will free memory associated with dropped hydrotable staging rows)
+                    conn.execute("CHECKPOINT;")
+
             except Exception as e:
                 print(f"  -> Error in batch {batch_num}: {e}")
                 # Continue with next batch instead of failing completely
                 continue
 
-        # Perform bulk insert from staging to final table
-        print("\nPerforming bulk insert from staging to Hydrotables table...")
-        conn.execute("""
-            INSERT INTO Hydrotables 
-            SELECT * FROM Hydrotables_Staging 
-            ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING;
-        """)
+        # Report final count
         final_count = conn.execute("SELECT COUNT(*) FROM Hydrotables").fetchone()[0]
-        print(f"-> Total hydrotable records in table: {final_count}")
+        print(f"\n-> Total hydrotable records in final table: {final_count}")
 
         # Clean up staging table
         print("Cleaning up staging table...")
@@ -414,7 +426,7 @@ def main():
     p.add_argument(
         "--batch-size",
         type=int,
-        default=10,
+        default=20,
         help="Batch size for processing files. The larger the tables that will be created the smaller this needs to be to avoid running out of memory while running the queries.",
     )
     p.add_argument("--output-dir", help="If provided, export tables to this S3 or local directory.")
