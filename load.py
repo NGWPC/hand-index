@@ -202,135 +202,24 @@ def load_hand_suite(
         print("Cleaning up Catchments staging table...")
         conn.execute("DROP TABLE Catchments_Staging;")
 
-        # Create branch path lookup table for faster joins during CSV processing
-        print("Creating branch path lookup table for optimized CSV processing...")
-        conn.execute("""
-            CREATE TEMP TABLE branch_lookup AS 
-            SELECT DISTINCT catchment_id, branch_path, h3_index 
-            FROM Catchments
-            WHERE branch_path IS NOT NULL;
-        """)
-        conn.execute("CREATE INDEX idx_branch_lookup ON branch_lookup(branch_path);")
-        lookup_count = conn.execute("SELECT COUNT(*) FROM branch_lookup").fetchone()[0]
-        print(f"-> Branch lookup table created with {lookup_count} entries")
-
         # Loading entire catchments table first for data integrity. Catchments must exist before Hydrotables can reference them.
 
-        print("\nProcessing and inserting HydroTable data (with h3_index)...")
+        print("\nProcessing and inserting HydroTable CSV paths...")
 
-        # Create staging table for Hydrotables
-        print("Creating staging table for Hydrotables...")
-        conn.execute("CREATE TEMP TABLE Hydrotables_Staging AS SELECT * FROM Hydrotables LIMIT 0;")
+        csv_dir_extractor = f"regexp_extract(file, '(.*/{'branches/[^/]+/' if not calb else '[^/]+/'})')"
 
-        csv_dir_extractor = f"regexp_extract(filename, '(.*/{'branches/[^/]+/' if not calb else '[^/]+/'})')"
+        hydrotable_insert_sql = f"""
+        INSERT INTO Hydrotables (catchment_id, csv_path)
+        SELECT DISTINCT
+            c.catchment_id,
+            csv_files.file AS csv_path
+        FROM (SELECT file FROM glob('{csv_glob}')) AS csv_files
+        JOIN Catchments c ON c.branch_path = {csv_dir_extractor};
+        """
 
-        # Build dynamic aggregation SQL using DuckDB metadata. Doing it this way so that this script doesn't need to have any knowledge of the columns in the hydrotable.csv's. As long as the hydrotables schema has the correct numeric and numeric array types and the same column names as the csv's you are ingesting then the code is able to figure out which columns in hydrotable csv need to be aggregated to arrays and which columns to leave as scalars. Aggregation is by HydroID
-
-        # Get column info for building aggregation
-        column_info = conn.execute("""
-            SELECT column_name, data_type
-            FROM information_schema.columns 
-            WHERE table_name = 'Hydrotables' AND table_schema = 'main'
-            AND column_name NOT IN ('catchment_id', 'hand_version_id', 'HydroID', 'nwm_version_id', 'h3_index')
-            ORDER BY ordinal_position
-        """).fetchall()
-
-        # Build two versions of aggregation SQL - one for pre-aggregation (without table prefix) and one for direct use
-        agg_columns_no_prefix = []
-        select_columns = []
-
-        for col_name, data_type in column_info:
-            if data_type.endswith("[]"):  # Array type
-                agg_columns_no_prefix.append(f'ARRAY_AGG("{col_name}") AS "{col_name}"')
-            else:  # Scalar type
-                agg_columns_no_prefix.append(f'FIRST("{col_name}") AS "{col_name}"')
-            select_columns.append(f'pre_aggregated."{col_name}"')
-
-        agg_sql_no_prefix = ", ".join(agg_columns_no_prefix)
-        select_columns_str = ", ".join(select_columns)
-
-        # First, get list of all CSV files to process
-        print("Discovering CSV files...")
-        # Use glob to get file list without reading CSV content
-        csv_files_query = f"SELECT file FROM glob('{csv_glob}')"
-        csv_files = [row[0] for row in conn.execute(csv_files_query).fetchall()]
-        print(f"Found {len(csv_files)} CSV files to process")
-
-        # Process CSVs in batches using the provided batch_size parameter
-        for i in range(0, len(csv_files), batch_size):
-            batch_files = csv_files[i : i + batch_size]
-            batch_num = i // batch_size + 1
-            total_batches = (len(csv_files) + batch_size - 1) // batch_size
-            print(f"Processing batch {batch_num}/{total_batches} ({len(batch_files)} files)...")
-
-            # Create a union of the batch files
-            file_unions = " UNION ALL ".join(
-                [
-                    f"SELECT {csv_dir_extractor} AS csv_dir, * FROM read_csv_auto('{file}', filename=TRUE, union_by_name=TRUE, all_varchar=TRUE)"
-                    for file in batch_files
-                ]
-            )
-
-            hydrotable_insert_sql = f"""
-            WITH raw_csv_data AS (
-                {file_unions}
-            ),
-            pre_aggregated AS (
-                SELECT 
-                    csv_dir,
-                    HydroID,
-                    {agg_sql_no_prefix}
-                FROM raw_csv_data
-                WHERE HydroID IS NOT NULL AND HydroID != ''
-                GROUP BY csv_dir, HydroID
-            )
-            INSERT INTO Hydrotables_Staging
-            SELECT
-                c.catchment_id,
-                '{hand_version}' as hand_version_id,
-                pre_aggregated.HydroID,
-                '{nwm_version}' as nwm_version_id,
-                c.h3_index,
-                {select_columns_str}
-            FROM pre_aggregated
-            JOIN branch_lookup c ON c.branch_path = pre_aggregated.csv_dir
-            ;
-            """
-
-            try:
-                result = conn.execute(hydrotable_insert_sql)
-                rowcount = result.rowcount if hasattr(result, "rowcount") else 0
-                print(f"  -> Batch {batch_num} inserted to staging table.")
-
-                # Flush staging table to final table every 1000 batches
-                if batch_num % 1000 == 0 or batch_num == total_batches:
-                    print(f"  -> Flushing staging table to final table (batch {batch_num})...")
-                    flush_result = conn.execute("""
-                        INSERT INTO Hydrotables 
-                        SELECT * FROM Hydrotables_Staging 
-                        ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING;
-                    """)
-                    flush_count = flush_result.rowcount if hasattr(flush_result, "rowcount") else 0
-                    print(f"  -> Flushed {flush_count} records to final table.")
-
-                    # Clear staging table for next batch
-                    conn.execute("TRUNCATE TABLE Hydrotables_Staging;")
-
-                    # Force checkpoint to free memory (will free memory associated with dropped hydrotable staging rows)
-                    conn.execute("CHECKPOINT;")
-
-            except Exception as e:
-                print(f"  -> Error in batch {batch_num}: {e}")
-                # Continue with next batch instead of failing completely
-                continue
-
-        # Report final count
-        final_count = conn.execute("SELECT COUNT(*) FROM Hydrotables").fetchone()[0]
-        print(f"\n-> Total hydrotable records in final table: {final_count}")
-
-        # Clean up staging table
-        print("Cleaning up staging table...")
-        conn.execute("DROP TABLE Hydrotables_Staging;")
+        conn.execute(hydrotable_insert_sql)
+        hydrotable_count = conn.execute("SELECT COUNT(*) FROM Hydrotables").fetchone()[0]
+        print(f"-> Total hydrotable CSV records in table: {hydrotable_count}")
 
         # Process REM rasters
         print("\nProcessing and inserting REM rasters...")
@@ -373,7 +262,7 @@ def load_hand_suite(
 
 
 def partition_tables_to_parquet(db_path: str, output_dir: str):
-    """Exports tables from DuckDB to a partitioned Parquet dataset using per-partition COPY to avoid memory issues."""
+    """Exports tables from DuckDB to Parquet datasets."""
     print(f"\n--- Starting Parquet Export to {output_dir} ---")
 
     # Ensure output_dir ends with slash
@@ -383,52 +272,22 @@ def partition_tables_to_parquet(db_path: str, output_dir: str):
         print("Loading extensions for S3 export (httpfs, aws)...")
         conn.execute("INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;")
 
-        # Export partitioned tables using per-partition COPY
-        partitioned_tables = ["Catchments", "Hydrotables"]
-        for table in partitioned_tables:
-            start_time = time.time()
-            print(f"\n  Exporting table '{table}' partitioned by h3_index...")
+        # Export Catchments table with native partitioning
+        start_time = time.time()
+        print(f"\n  Exporting Catchments table partitioned by h3_index...")
 
-            # Find all h3_index values
-            partition_rows = conn.execute(f"""
-                SELECT DISTINCT h3_index
-                FROM {table}
-                WHERE h3_index IS NOT NULL
-                ORDER BY h3_index
-            """).fetchall()
+        catchments_output = f"{output_dir}catchments/"
+        conn.execute(f"""
+            COPY (SELECT * FROM Catchments)
+            TO '{catchments_output}'
+            (FORMAT PARQUET, PARTITION_BY (h3_index), OVERWRITE_OR_IGNORE 1)
+        """)
 
-            print(f"    Found {len(partition_rows)} partitions in '{table}'")
+        elapsed = time.time() - start_time
+        print(f"  -> Finished Catchments table in {elapsed:.2f} seconds.")
 
-            # Export each partition separately to avoid memory issues
-            for idx, (h3,) in enumerate(partition_rows):
-                # Build a Hive-style partition directory
-                partition_dir = f"{output_dir}{table.lower()}/h3_index={h3}/"
-                # Export to data_0.parquet file within partition directory
-                partition_file = f"{partition_dir}data_0.parquet"
-
-                # Note: DuckDB COPY will create the directory if needed
-                sql = f"""
-                COPY (
-                    SELECT *
-                    FROM {table}
-                    WHERE h3_index = {h3}
-                )
-                TO '{partition_file}'
-                (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1)
-                """
-
-                try:
-                    if idx % 5 == 0:  # Progress update every 5 partitions
-                        print(f"    Progress: {idx}/{len(partition_rows)} partitions exported...")
-                    conn.execute(sql)
-                except Exception as e:
-                    print(f"    WARNING: Failed on h3_index={h3}: {e}")
-
-            elapsed = time.time() - start_time
-            print(f"  -> Finished '{table}' ({len(partition_rows)} partitions) in {elapsed:.2f} seconds.")
-
-        # Export non-partitioned raster tables as single files
-        single_file_tables = ["HAND_REM_Rasters", "HAND_Catchment_Rasters"]
+        # Export non-partitioned tables as single files
+        single_file_tables = ["Hydrotables", "HAND_REM_Rasters", "HAND_Catchment_Rasters"]
         for table in single_file_tables:
             start_time = time.time()
             file_path = f"{output_dir}{table.lower()}.parquet"
