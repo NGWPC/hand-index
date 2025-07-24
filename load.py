@@ -54,7 +54,7 @@ def load_hand_suite(
 
         # Configure memory management and spilling
         print("Configuring memory management...")
-        conn.execute("SET memory_limit = '25GB';")
+        conn.execute("SET memory_limit = '7GB';")
         conn.execute("SET temp_directory = '/tmp';")
         conn.execute("SET preserve_insertion_order = false;")
 
@@ -373,32 +373,64 @@ def load_hand_suite(
 
 
 def partition_tables_to_parquet(db_path: str, output_dir: str):
-    """Exports tables from DuckDB to a partitioned Parquet dataset."""
+    """Exports tables from DuckDB to a partitioned Parquet dataset using per-partition COPY to avoid memory issues."""
     print(f"\n--- Starting Parquet Export to {output_dir} ---")
+
+    # Ensure output_dir ends with slash
+    output_dir = output_dir.rstrip("/") + "/"
+
     with duckdb.connect(db_path, read_only=True) as conn:
         print("Loading extensions for S3 export (httpfs, aws)...")
         conn.execute("INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;")
-        output_dir = output_dir.rstrip("/") + "/"
 
-        # Export partitioned tables
+        # Export partitioned tables using per-partition COPY
         partitioned_tables = ["Catchments", "Hydrotables"]
         for table in partitioned_tables:
             start_time = time.time()
-            partition_path = f"{output_dir}{table.lower()}/"
-            print(f"  Exporting '{table}' to '{partition_path}' (partitioned by h3_index)...")
-            conn.execute(f"""
-                COPY (SELECT * FROM {table} WHERE h3_index IS NOT NULL)
-                TO '{partition_path}'
-                WITH (FORMAT PARQUET, PARTITION_BY (h3_index), OVERWRITE_OR_IGNORE 1);
-            """)
-            print(f"  -> Finished '{table}' in {time.time() - start_time:.2f} seconds.")
+            print(f"\n  Exporting table '{table}' partitioned by h3_index...")
+
+            # Find all h3_index values
+            partition_rows = conn.execute(f"""
+                SELECT DISTINCT h3_index
+                FROM {table}
+                WHERE h3_index IS NOT NULL
+                ORDER BY h3_index
+            """).fetchall()
+
+            print(f"    Found {len(partition_rows)} partitions in '{table}'")
+
+            # Export each partition separately to avoid memory issues
+            for idx, (h3,) in enumerate(partition_rows):
+                # Build a Hive-style partition directory
+                partition_dir = f"{output_dir}{table.lower()}/h3_index={h3}/"
+
+                # Note: DuckDB COPY will create the directory if needed
+                sql = f"""
+                COPY (
+                    SELECT *
+                    FROM {table}
+                    WHERE h3_index = {h3}
+                )
+                TO '{partition_dir}'
+                (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1)
+                """
+
+                try:
+                    if idx % 5 == 0:  # Progress update every 5 partitions
+                        print(f"    Progress: {idx}/{len(partition_rows)} partitions exported...")
+                    conn.execute(sql)
+                except Exception as e:
+                    print(f"    WARNING: Failed on h3_index={h3}: {e}")
+
+            elapsed = time.time() - start_time
+            print(f"  -> Finished '{table}' ({len(partition_rows)} partitions) in {elapsed:.2f} seconds.")
 
         # Export non-partitioned raster tables as single files
         single_file_tables = ["HAND_REM_Rasters", "HAND_Catchment_Rasters"]
         for table in single_file_tables:
             start_time = time.time()
             file_path = f"{output_dir}{table.lower()}.parquet"
-            print(f"  Exporting '{table}' to '{file_path}' (single file)...")
+            print(f"\n  Exporting '{table}' to '{file_path}' (single file)...")
             conn.execute(f"""
                 COPY {table}
                 TO '{file_path}'
@@ -463,7 +495,6 @@ def main():
                 f"Error: Database file already exists at {args.db_path}. Remove it or use --skip-load to work with existing database."
             )
             return
-        # Initialize new database with schema
         with duckdb.connect(args.db_path) as conn:
             with open(args.schema_path, "r") as f:
                 schema_sql = f.read()

@@ -14,6 +14,7 @@ import duckdb
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Polygon
+from shapely.wkb import loads
 from shapely.wkt import dumps
 
 # Setup logging
@@ -114,7 +115,7 @@ def get_catchment_data_for_geojson_poly_split_partitioned(
         + """
     SELECT
       fc.catchment_id,
-      ST_GeomFromWKB(fc.geometry) AS geom_wkb
+      fc.geometry AS geom_wkb
     FROM filtered_catchments AS fc;
     """
     )
@@ -124,9 +125,10 @@ def get_catchment_data_for_geojson_poly_split_partitioned(
         empty_gdf = gpd.GeoDataFrame(columns=["catchment_id", "geometry"], geometry="geometry", crs="EPSG:5070")
         return empty_gdf, pd.DataFrame(), query_poly_5070
 
-    # Direct use - DuckDB already converted WKB to GEOMETRY objects
+    # Convert WKB data to Shapely geometry objects. Wrapping wkb in bytes because duckdb exports a bytearray but shapely wants bytes.
+    geom_df["geometry"] = geom_df["geom_wkb"].apply(lambda wkb: loads(bytes(wkb)) if wkb is not None else None)
     geometries_gdf = gpd.GeoDataFrame(
-        geom_df[["catchment_id", "geom_wkb"]].rename(columns={"geom_wkb": "geometry"}),
+        geom_df[["catchment_id", "geometry"]],
         geometry="geometry",
         crs="EPSG:5070",
     )
@@ -138,13 +140,12 @@ def get_catchment_data_for_geojson_poly_split_partitioned(
     SELECT
       fc.catchment_id,
       h.* EXCLUDE (catchment_id, h3_index),
-      hrr.rem_raster_id,
       hrr.raster_path AS rem_raster_path,
       hcr.raster_path AS catchment_raster_path
     FROM filtered_catchments AS fc
     LEFT JOIN hydrotables_partitioned AS h ON fc.catchment_id = h.catchment_id
     LEFT JOIN hand_rem_rasters_partitioned AS hrr ON fc.catchment_id = hrr.catchment_id
-    LEFT JOIN hand_catchment_rasters_partitioned AS hcr ON hrr.rem_raster_id = hcr.rem_raster_id;
+    LEFT JOIN hand_catchment_rasters_partitioned AS hcr ON fc.catchment_id = hcr.catchment_id;
     """
     )
     attributes_df = con.execute(sql_attr).fetch_df()
