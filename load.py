@@ -403,6 +403,8 @@ def partition_tables_to_parquet(db_path: str, output_dir: str):
             for idx, (h3,) in enumerate(partition_rows):
                 # Build a Hive-style partition directory
                 partition_dir = f"{output_dir}{table.lower()}/h3_index={h3}/"
+                # Export to data_0.parquet file within partition directory
+                partition_file = f"{partition_dir}data_0.parquet"
 
                 # Note: DuckDB COPY will create the directory if needed
                 sql = f"""
@@ -411,7 +413,7 @@ def partition_tables_to_parquet(db_path: str, output_dir: str):
                     FROM {table}
                     WHERE h3_index = {h3}
                 )
-                TO '{partition_dir}'
+                TO '{partition_file}'
                 (FORMAT PARQUET, OVERWRITE_OR_IGNORE 1)
                 """
 
