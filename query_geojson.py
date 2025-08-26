@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-Fetch catchment data from DuckDB, filter by spatial overlap,
-and write per-catchment attribute tables to separate Parquet files.
-"""
-
 import argparse
 import logging
 import os
@@ -18,7 +12,9 @@ from shapely.wkb import loads
 from shapely.wkt import dumps
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
@@ -122,11 +118,17 @@ def get_catchment_data_for_geojson_poly_split_partitioned(
     geom_df = con.execute(sql_geom).fetch_df()
     if geom_df.empty:
         logger.info("No catchments intersect the query polygon.")
-        empty_gdf = gpd.GeoDataFrame(columns=["catchment_id", "geometry"], geometry="geometry", crs="EPSG:5070")
+        empty_gdf = gpd.GeoDataFrame(
+            columns=["catchment_id", "geometry"],
+            geometry="geometry",
+            crs="EPSG:5070",
+        )
         return empty_gdf, pd.DataFrame(), query_poly_5070
 
     # Convert WKB data to Shapely geometry objects. Wrapping wkb in bytes because duckdb exports a bytearray but shapely wants bytes.
-    geom_df["geometry"] = geom_df["geom_wkb"].apply(lambda wkb: loads(bytes(wkb)) if wkb is not None else None)
+    geom_df["geometry"] = geom_df["geom_wkb"].apply(
+        lambda wkb: loads(bytes(wkb)) if wkb is not None else None
+    )
     geometries_gdf = gpd.GeoDataFrame(
         geom_df[["catchment_id", "geometry"]],
         geometry="geometry",
@@ -174,37 +176,61 @@ def filter_dataframes_by_overlap(
         "initial_attrs": len(attributes_df),
     }
     if geometries_gdf.empty or query_polygon_5070 is None:
-        stats.update(final_geoms=0, final_attrs=0, removed_geoms=0, removed_attrs=0)
+        stats.update(
+            final_geoms=0, final_attrs=0, removed_geoms=0, removed_attrs=0
+        )
         return geometries_gdf.copy(), attributes_df.copy(), stats
 
     geoms = geometries_gdf.copy()
 
     # Compute geometric relationships
     geoms["area"] = geoms.geometry.area
-    geoms["inter"] = geoms.geometry.apply(lambda g: g.intersection(query_polygon_5070).area if not g.is_empty else 0.0)
-    geoms["overlap_pct"] = (geoms["inter"] / geoms["area"].replace({0: pd.NA})) * 100
+    geoms["inter"] = geoms.geometry.apply(
+        lambda g: g.intersection(query_polygon_5070).area
+        if not g.is_empty
+        else 0.0
+    )
+    geoms["overlap_pct"] = (
+        geoms["inter"] / geoms["area"].replace({0: pd.NA})
+    ) * 100
     geoms["overlap_pct"] = geoms["overlap_pct"].fillna(0.0)
 
     # Check contains/within relationships
-    geoms["contains_query"] = geoms.geometry.apply(lambda g: g.contains(query_polygon_5070))
-    geoms["within_query"] = geoms.geometry.apply(lambda g: g.within(query_polygon_5070))
+    geoms["contains_query"] = geoms.geometry.apply(
+        lambda g: g.contains(query_polygon_5070)
+    )
+    geoms["within_query"] = geoms.geometry.apply(
+        lambda g: g.within(query_polygon_5070)
+    )
 
     # Debug: log the geometric relationships
     contains_count = geoms["contains_query"].sum()
     within_count = geoms["within_query"].sum()
-    logger.info(f"Geometric relationships: {contains_count} contain query, {within_count} within query")
+    logger.info(
+        f"Geometric relationships: {contains_count} contain query, {within_count} within query"
+    )
 
     # Apply selection criteria: contains OR within OR overlap > threshold
     overlap_threshold_decimal = overlap_threshold_percent / 100.0
     selection_mask = (
-        geoms["contains_query"] | geoms["within_query"] | (geoms["overlap_pct"] >= overlap_threshold_percent)
+        geoms["contains_query"]
+        | geoms["within_query"]
+        | (geoms["overlap_pct"] >= overlap_threshold_percent)
     )
 
     keep_ids = set(geoms.loc[selection_mask, "catchment_id"])
     filtered_geoms = geoms[geoms.catchment_id.isin(keep_ids)].drop(
-        columns=["area", "inter", "overlap_pct", "contains_query", "within_query"]
+        columns=[
+            "area",
+            "inter",
+            "overlap_pct",
+            "contains_query",
+            "within_query",
+        ]
     )
-    filtered_attrs = attributes_df[attributes_df.catchment_id.isin(keep_ids)].copy()
+    filtered_attrs = attributes_df[
+        attributes_df.catchment_id.isin(keep_ids)
+    ].copy()
 
     # Enhanced statistics
     stats["final_geoms"] = len(filtered_geoms)
@@ -214,15 +240,26 @@ def filter_dataframes_by_overlap(
     stats["contains_count"] = geoms["contains_query"].sum()
     stats["within_count"] = geoms["within_query"].sum()
     stats["overlap_only_count"] = (
-        (geoms["overlap_pct"] >= overlap_threshold_percent) & ~geoms["contains_query"] & ~geoms["within_query"]
+        (geoms["overlap_pct"] >= overlap_threshold_percent)
+        & ~geoms["contains_query"]
+        & ~geoms["within_query"]
     ).sum()
 
     return filtered_geoms, filtered_attrs, stats
 
 
 def main():
-    p = argparse.ArgumentParser(description="Fetch/filter catchments and write per-ID Parquet files")
-    p.add_argument("-g", "--geojson", required=True, help="Path to query GeoJSON")
+    """
+    Fetch catchment data from DuckDB, filter by spatial overlap,
+    and write per-catchment attribute tables to separate Parquet files.
+    """
+
+    p = argparse.ArgumentParser(
+        description="Fetch/filter catchments and write per-ID Parquet files"
+    )
+    p.add_argument(
+        "-g", "--geojson", required=True, help="Path to query GeoJSON"
+    )
     p.add_argument(
         "-p",
         "--partitioned-path",
@@ -264,12 +301,16 @@ def main():
     create_partitioned_views(con, args.partitioned_path)
 
     # Fetch & filter
-    geoms, attrs, query_poly_5070 = get_catchment_data_for_geojson_poly_split_partitioned(args.geojson, con)
+    geoms, attrs, query_poly_5070 = (
+        get_catchment_data_for_geojson_poly_split_partitioned(args.geojson, con)
+    )
     if geoms.empty:
         logger.info("No geometries found. Exiting.")
         return
 
-    fg, fa, stats = filter_dataframes_by_overlap(geoms, attrs, query_poly_5070, args.threshold)
+    fg, fa, stats = filter_dataframes_by_overlap(
+        geoms, attrs, query_poly_5070, args.threshold
+    )
     logger.info("Overlap filter summary: %s", stats)
 
     # Prepare output directory
@@ -288,7 +329,9 @@ def main():
 
         out_path = outdir / f"{catch_id}.parquet"
         df.to_parquet(str(out_path), index=False)
-        logger.info("Wrote %d rows for catchment '%s' → %s", len(df), catch_id, out_path)
+        logger.info(
+            "Wrote %d rows for catchment '%s' → %s", len(df), catch_id, out_path
+        )
 
     con.close()
 
