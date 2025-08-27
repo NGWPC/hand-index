@@ -25,7 +25,6 @@ def load_hand_suite(
     db_path: str,
     hand_dir: str,
     hand_version: str,
-    nwm_version: str,
     h3_resolution: int,
     calb: bool,
     batch_size: int = 100,
@@ -308,11 +307,10 @@ def main():
     p.add_argument(
         "--schema-path",
         default="./schema/hand-index-ver-fim100-uncalb.sql",
-        help="Path to SQL schema file (default: ./schema/hand-index-ver-fim100-uncalb.sql)",
+        help="Path to SQL schema file (default: ./schema/hand-index-ver-fim100.sql)",
     )
     p.add_argument("--hand-dir", required=True)
     p.add_argument("--hand-version", required=True)
-    p.add_argument("--nwm-version", required=True)
     p.add_argument("--h3-resolution", type=int, default=1)
     p.add_argument("--calb", action="store_true")
     p.add_argument("--skip-load", action="store_true")
@@ -367,7 +365,6 @@ def main():
             db_path=args.db_path,
             hand_dir=args.hand_dir,
             hand_version=args.hand_version,
-            nwm_version=str(Decimal(args.nwm_version)),
             h3_resolution=args.h3_resolution,
             calb=args.calb,
             batch_size=args.batch_size,

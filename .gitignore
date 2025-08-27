@@ -1,4 +1,6 @@
-pg_volume/
+.env
+data/
+queries/
 test_data/
 .venv/
 *.ddb*
