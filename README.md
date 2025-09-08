@@ -38,6 +38,8 @@ AWS_SESSION_TOKEN=your_session_token_if_using_temp_credentials
 AWS_DEFAULT_REGION=us-east-1
 ```
 
+Note: make sure your AWS credentials aren't quoted! This will lead to credential errors.
+
 Then you would run `load.py` using the built docker image with the following command from the repository root:
 
 ```
